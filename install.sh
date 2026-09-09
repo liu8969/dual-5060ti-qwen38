@@ -240,14 +240,15 @@ if [ "$USE_SYSTEMD" = "1" ]; then
   elif sudo -n true 2>/dev/null; then
     sed -e "s|^User=.*|User=$(id -un)|" \
         -e "s|^Group=.*|Group=$(id -gn)|" \
-        -e "s|/home/lcy|$HOME|g" \
+        -e "s|^Environment=USER=.*|Environment=USER=$(id -un)|" \
+        -e "s|/home/USER|$HOME|g" \
         "$SRC_DIR/systemd/modelctl.service" | sudo tee "$UNIT" >/dev/null
     sudo systemctl daemon-reload
     sudo systemctl enable modelctl
     ok "systemd unit installed + enabled (survives reboot, auto-restarts on crash)"
   else
     warn "sudo needs a password — install the unit manually:"
-    info "  sed -e 's|/home/lcy|$HOME|g' $SRC_DIR/systemd/modelctl.service | sudo tee $UNIT"
+    info "  sed -e 's|/home/USER|$HOME|g' $SRC_DIR/systemd/modelctl.service | sudo tee $UNIT"
     info "  sudo systemctl daemon-reload && sudo systemctl enable --now modelctl"
   fi
 fi

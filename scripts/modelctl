@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# modelctl - one entry point for the local model services on lcy-pc.
+# modelctl - one entry point for the local model services on this host.
 #
 #   modelctl status            what is running, is it healthy, KV pool, VRAM
 #   modelctl start <profile>   start a profile (waits, detects early death)
@@ -10,19 +10,20 @@
 #   modelctl supervise <profile>   keep it alive (restart on crash)
 #
 # Profiles:
-#   vllm-dflash    vLLM + Merkyor W4A4 + DFlash2 + FP8 KV   (150K, ~125 tok/s)
+#   vllm-dflash    vLLM + Merkyor W4A4 + DFlash2 + FP8 KV   (150K, ~116 tok/s)
 #   vllm-mtp       vLLM + Merkyor W4A4 + MTP3 + FP8 KV      (150K, ~73 tok/s)
 #   sglang         SGLang + Merkyor W4A4 + DFlash2          (106K, ~100 tok/s)
 #   llama168       llama.cpp Q6_K + MTP2                    (168K, ~56 tok/s)
 #   llama256       llama.cpp GSQ-RCO IQ3_S + DFlash2        (256K, ~66 tok/s)
 set -uo pipefail
 
-D=/home/lcy/deploy-5060ti
-STATE=/home/lcy/.modelctl.state          # current profile name
-PIDFILE=/home/lcy/.modelctl.supervisor   # supervisor pid, if any
-PORT=8080
+D="${DEPLOY_DIR:-$HOME/deploy-5060ti}"
+MODELS="${MODELS:-$HOME/Models}"
+STATE="${MODELCTL_STATE:-$HOME/.modelctl.state}"          # current profile name
+PIDFILE="${MODELCTL_PIDFILE:-$HOME/.modelctl.supervisor}" # supervisor pid, if any
+PORT="${PORT:-8080}"
 HEALTH="http://127.0.0.1:${PORT}/health"
-LOG_DIR=/home/lcy/modelctl-logs
+LOG_DIR="${LOG_DIR:-$HOME/modelctl-logs}"
 mkdir -p "$LOG_DIR"
 
 say() { echo "[$(date +%T)] $*"; }
@@ -47,7 +48,7 @@ profile_cmd() {
       echo "KVBYTES=${KVBYTES:-3865470566} MAXNUM=${MAXNUM:-1024} UTIL=${UTIL:-0.977} SEQ=${SEQ:-4} setsid nohup bash $D/vllm-merkyor-dflash-launch.sh"
       ;;
     vllm-mtp)
-      echo "MAX_JOBS=2 MODEL=/home/lcy/Models/Merkyor-W4A4/NVFP4/W4A4 MTP_N=3 MAXLEN=${MAXLEN:-150000} setsid nohup bash $D/vllm-merkyor-launch.sh"
+      echo "MAX_JOBS=${MAX_JOBS:-2} MODEL=$MODELS/Merkyor-W4A4/NVFP4/W4A4 MTP_N=3 MAXLEN=${MAXLEN:-150000} setsid nohup bash $D/vllm-merkyor-launch.sh"
       ;;
     sglang)
       echo "setsid nohup bash $D/sglang-merkyor-launch.sh"
@@ -56,7 +57,7 @@ profile_cmd() {
       echo "setsid nohup bash $D/launch.sh"
       ;;
     llama256)
-      echo "BIN=/home/lcy/llama.cpp-new/build/bin/llama MODEL=/home/lcy/Models/GSQ-RCO/Qwen3.8-27B-GSQ-RCO-IQ3_S.gguf KVT=q8_0 CTX=262144 SPLIT=layer setsid nohup bash $D/launch-256k-dflash.sh"
+      echo "BIN=${LLAMA_BIN:-$HOME/llama.cpp/build/bin/llama} MODEL=$MODELS/GSQ-RCO/Qwen3.8-27B-GSQ-RCO-IQ3_S.gguf KVT=q8_0 CTX=262144 SPLIT=layer setsid nohup bash $D/launch-256k-dflash.sh"
       ;;
     *) return 1 ;;
   esac

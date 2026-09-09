@@ -146,11 +146,11 @@ vLLM 0.28.0 + Merkyor W4A4 + DFlash2 + FP8 KV
 ### 6.2 现在正确的方式
 
 ```bash
-ssh lcy@192.168.0.119 'bash ~/deploy-5060ti/modelctl status'
-ssh lcy@192.168.0.119 'bash ~/deploy-5060ti/modelctl start vllm-dflash'   # 每 30s 打印进度，死了立刻报错
-ssh lcy@192.168.0.119 'bash ~/deploy-5060ti/modelctl logs 60'
-ssh lcy@192.168.0.119 'bash ~/deploy-5060ti/modelctl bench'
-echo 8206 | sudo -S systemctl restart modelctl     # 整体重启（systemd 托管）
+ssh <user>@<host> 'bash ~/deploy-5060ti/modelctl status'
+ssh <user>@<host> 'bash ~/deploy-5060ti/modelctl start vllm-dflash'   # 每 30s 打印进度，死了立刻报错
+ssh <user>@<host> 'bash ~/deploy-5060ti/modelctl logs 60'
+ssh <user>@<host> 'bash ~/deploy-5060ti/modelctl bench'
+sudo systemctl restart modelctl                     # 整体重启（systemd 托管）
 ```
 
 - **双层兜底**：systemd（`Restart=always` + `enable`，开机自启）+ 内置 `supervise`。
@@ -187,7 +187,7 @@ https://flashinfer.ai/whl/cu130/flashinfer-jit-cache/
 # 国内代理（直连 GitHub 只有 60 KB/s，代理 2.9 MB/s 起）
 https://gh-proxy.com/https://github.com/flashinfer-ai/flashinfer/releases/download/...
 # venv 里没有 pip，要用 uv
-/home/lcy/.local/bin/uv pip install --python /home/lcy/vllm-venv/bin/python <wheel>
+~/.local/bin/uv pip install --python ~/vllm-venv/bin/python <wheel>
 ```
 
 - 已装 `flashinfer-jit-cache==0.6.16.post3+cu130`：**959 个预编译模块**，含 `fp4_gemm_cutlass_sm120`、`gemm_sm120`、`nvfp4_attention_sm120`、388 个 xqa 变体等。

@@ -151,7 +151,7 @@ after startup is 10–20% slower); run it twice.
 - Do not change the served model id.
 - Do not run `docker rm -f $(docker ps -aq)` unless you know what else runs on the host
   (`modelctl`'s `kill_all` does this by design — be aware).
-- Do not tune by editing files in `/home/lcy` and restarting blindly; edit, restart, measure, report.
+- Do not tune by editing files under `$HOME` and restarting blindly; edit, restart, measure, report.
 - Do not leave the supervisor running against a profile you then stop manually — `modelctl stop`
   handles both; killing only the server leaves the supervisor to resurrect it.
 
@@ -165,7 +165,7 @@ after startup is 10–20% slower); run it twice.
 | `scripts/vllm-merkyor-dflash-launch.sh` | production launch script (all knobs are env-overridable) |
 | `scripts/bench_gsq.py` | single-stream + needle recall |
 | `scripts/bench_concurrency.py` | concurrency sweep |
-| `systemd/modelctl.service` | unit template (`/home/lcy` replaced at install time) |
+| `systemd/modelctl.service` | unit template (`/home/USER` replaced at install time) |
 | `docs/PITFALLS.md` | full pitfall log — read before redesigning anything |
 | `docs/BENCHMARKS.md` | archived measurements |
 
