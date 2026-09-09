@@ -28,12 +28,28 @@ flashinfer 0.6.16.post3 + flashinfer-jit-cache（预编译内核，启动不编�
 
 ## 快速开始
 
+**方式一：自己装（推荐先干跑）**
+
 ```bash
 git clone https://github.com/<you>/dual-5060ti-qwen38.git && cd dual-5060ti-qwen38
 DRY_RUN=1 bash install.sh     # 看看要做什么
 bash install.sh               # 装好并启动
 bash bench.sh                 # 复现下面的数字
 ```
+
+**方式二：整个项目丢给 AI agent**
+
+不用自己读参数，把仓库（或压缩包）交给任意 AI coding agent（Claude Code / Cursor / DSH / Codex…），
+粘这段话就行：
+
+```text
+先完整读 README.ai.md，然后按它操作。目标：在本机（2× 16GB Blackwell, 31GB 内存）安装并验证
+这个推理服务。每一步都要实测，最后报告四个数字：health、KV 池、每卡显存、bench 吞吐。
+硬约束：用 modelctl 做所有启停，不要 pkill，不要改 CUDA_HOME，不要动 max-num-batched-tokens。
+```
+
+`README.ai.md` 里已经写好：ground truth（每项带验证命令）、每个参数的取值理由、诊断决策树、
+失败签名对照表、变更协议（改一个参数 → 重启 → 测量 → 报告前后差值）。AI 不需要猜。
 
 ## 实测
 
@@ -78,9 +94,20 @@ vLLM 0.28.0 · flashinfer 0.6.16.post3 (+ prebuilt kernel wheel, no JIT at start
 
 **Host**: 2× RTX 5060 Ti 16 GB (sm_120a) · 31 GB RAM.
 
-**Quick start**: `DRY_RUN=1 bash install.sh` → `bash install.sh` → `bash bench.sh`.
+**Quick start**
 
-**For AI agents**: read [`README.ai.md`](README.ai.md) — full parameter rationale, diagnostic
-decision tree, failure signatures, and operating rules. `AGENTS.md` is the short version.
+1. Install it yourself: `DRY_RUN=1 bash install.sh` → `bash install.sh` → `bash bench.sh`.
+2. Or hand the whole repo to any AI coding agent and paste:
+
+```text
+Read README.ai.md in full first, then follow it. Goal: install and verify this inference server on
+this host (2× 16GB Blackwell, 31GB RAM). Measure every step and report four numbers at the end:
+health, KV pool, per-card VRAM, bench throughput. Hard constraints: use modelctl for all lifecycle
+operations, never pkill, never change CUDA_HOME, never touch --max-num-batched-tokens.
+```
+
+`README.ai.md` contains the ground truth (with a verification command per fact), the rationale behind
+every parameter, a diagnostic decision tree, a failure-signature table, and a change protocol —
+the agent does not have to guess. [`AGENTS.md`](AGENTS.md) is the condensed version.
 
 MIT licensed.
