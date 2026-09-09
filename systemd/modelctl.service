@@ -1,0 +1,33 @@
+[Unit]
+Description=Local model server (dual-5060ti-qwen38, modelctl supervised)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=lcy
+Group=lcy
+Environment=HOME=/home/lcy
+Environment=USER=lcy
+Environment=LANG=en_US.UTF-8
+# IMPORTANT / 重要: keep CUDA_HOME stable. FlashInfer's JIT cache key includes the
+# full nvcc path; changing CUDA_HOME forces a full 5-10 minute recompile.
+Environment=CUDA_HOME=/usr/local/cuda
+Environment=LD_LIBRARY_PATH=/usr/local/cuda/lib64
+Environment=PATH=/usr/local/cuda-13.3/bin:/home/lcy/vllm-venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=MODELCTL_PROFILE=vllm-dflash
+WorkingDirectory=/home/lcy/deploy-5060ti
+# Wait for VRAM to actually drain before starting (a crashed instance can hold
+# memory for a few seconds, which makes the first restart attempt OOM).
+ExecStartPre=/bin/bash -c 'for i in $(seq 1 30); do used=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | sort -rn | head -1); [ "$used" -lt 500 ] && exit 0; sleep 2; done; exit 0'
+ExecStart=/bin/bash /home/lcy/deploy-5060ti/modelctl supervise vllm-dflash
+ExecStop=/bin/bash /home/lcy/deploy-5060ti/modelctl stop
+Restart=always
+RestartSec=15
+KillMode=control-group
+TimeoutStopSec=90
+StandardOutput=append:/home/lcy/modelctl-logs/systemd.log
+StandardError=append:/home/lcy/modelctl-logs/systemd.log
+
+[Install]
+WantedBy=multi-user.target

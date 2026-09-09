@@ -1,0 +1,190 @@
+#!/usr/bin/env bash
+# modelctl - one entry point for the local model services on lcy-pc.
+#
+#   modelctl status            what is running, is it healthy, KV pool, VRAM
+#   modelctl start <profile>   start a profile (waits, detects early death)
+#   modelctl stop              stop whatever is running
+#   modelctl restart <profile>
+#   modelctl logs [n]          tail the current profile's log
+#   modelctl bench             short decode benchmark against :8080
+#   modelctl supervise <profile>   keep it alive (restart on crash)
+#
+# Profiles:
+#   vllm-dflash    vLLM + Merkyor W4A4 + DFlash2 + FP8 KV   (150K, ~125 tok/s)
+#   vllm-mtp       vLLM + Merkyor W4A4 + MTP3 + FP8 KV      (150K, ~73 tok/s)
+#   sglang         SGLang + Merkyor W4A4 + DFlash2          (106K, ~100 tok/s)
+#   llama168       llama.cpp Q6_K + MTP2                    (168K, ~56 tok/s)
+#   llama256       llama.cpp GSQ-RCO IQ3_S + DFlash2        (256K, ~66 tok/s)
+set -uo pipefail
+
+D=/home/lcy/deploy-5060ti
+STATE=/home/lcy/.modelctl.state          # current profile name
+PIDFILE=/home/lcy/.modelctl.supervisor   # supervisor pid, if any
+PORT=8080
+HEALTH="http://127.0.0.1:${PORT}/health"
+LOG_DIR=/home/lcy/modelctl-logs
+mkdir -p "$LOG_DIR"
+
+say() { echo "[$(date +%T)] $*"; }
+
+log_for() { echo "$LOG_DIR/$1.log"; }
+
+# kill anything model-server-ish; patterns are built at runtime so this script
+# can be invoked without the caller's own command line matching them.
+kill_all() {
+  pkill -9 -f 'vllm serve' 2>/dev/null
+  pkill -9 -f 'EngineCore' 2>/dev/null
+  pkill -9 -f 'sglang.launch_server' 2>/dev/null
+  pkill -9 -f 'docker run.*sglang' 2>/dev/null
+  docker rm -f $(docker ps -aq) >/dev/null 2>&1
+  pkill -9 -x llama 2>/dev/null
+  sleep 5
+}
+
+profile_cmd() {
+  case "$1" in
+    vllm-dflash)
+      echo "KVBYTES=${KVBYTES:-3865470566} MAXNUM=${MAXNUM:-1024} UTIL=${UTIL:-0.977} SEQ=${SEQ:-4} setsid nohup bash $D/vllm-merkyor-dflash-launch.sh"
+      ;;
+    vllm-mtp)
+      echo "MAX_JOBS=2 MODEL=/home/lcy/Models/Merkyor-W4A4/NVFP4/W4A4 MTP_N=3 MAXLEN=${MAXLEN:-150000} setsid nohup bash $D/vllm-merkyor-launch.sh"
+      ;;
+    sglang)
+      echo "setsid nohup bash $D/sglang-merkyor-launch.sh"
+      ;;
+    llama168)
+      echo "setsid nohup bash $D/launch.sh"
+      ;;
+    llama256)
+      echo "BIN=/home/lcy/llama.cpp-new/build/bin/llama MODEL=/home/lcy/Models/GSQ-RCO/Qwen3.8-27B-GSQ-RCO-IQ3_S.gguf KVT=q8_0 CTX=262144 SPLIT=layer setsid nohup bash $D/launch-256k-dflash.sh"
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+alive() { curl -s --max-time 3 "$HEALTH" >/dev/null 2>&1; }
+
+running_proc() {
+  pgrep -f 'vllm serve' >/dev/null 2>&1 && return 0
+  pgrep -f 'sglang.launch_server' >/dev/null 2>&1 && return 0
+  docker ps --format '{{.Names}}' 2>/dev/null | grep -q sglang && return 0
+  pgrep -x llama >/dev/null 2>&1 && return 0
+  return 1
+}
+
+cmd_start() {
+  local prof="${1:-vllm-dflash}" cmd log
+  if ! profile_cmd "$prof" >/dev/null 2>&1; then
+    echo "unknown profile: $prof (see header)"; exit 2
+  fi
+  log=$(log_for "$prof")
+  say "stopping any running server"
+  kill_all
+  nvidia-smi --query-gpu=index,memory.used --format=csv,noheader
+  cmd=$(profile_cmd "$prof")
+  say "starting $prof  (log: $log)"
+  eval "$cmd > '$log' 2>&1 < /dev/null &"
+  echo "$prof" > "$STATE"
+
+  local i waited
+  waited=0
+  # Compile-aware wait: FlashInfer JIT (nvcc/cicc) can take 5-10 min on a cold
+  # cache; the old 360s cap made the supervisor kill it mid-build forever.
+  for i in $(seq 1 480); do
+    if alive; then
+      say "UP after $((i*5))s"
+      grep -oE 'GPU KV cache size: [0-9,]+ tokens|Maximum concurrency for [0-9,]+ tokens per request: [0-9.]+x|max_total_num_tokens=[0-9]+|KV Cache is allocated[^,]*,[^,]*' "$log" | tail -3
+      curl -s --max-time 600 "http://127.0.0.1:${PORT}/v1/chat/completions" -H 'Content-Type: application/json' \
+        -d '{"model":"Qwen3.8-27B-Q6-dual-5060ti","messages":[{"role":"user","content":"hi"}],"max_tokens":1,"temperature":0}' >/dev/null \
+        && say "warmup ok"
+      nvidia-smi --query-gpu=index,memory.used --format=csv,noheader
+      return 0
+    fi
+    if ! running_proc; then
+      say "PROCESS DIED after $((i*5))s - last errors:"
+      grep -oE 'CUDA out of memory[^)]*|ValueError[^\n]{0,160}|RuntimeError[^\n]{0,160}|OutOfMemoryError[^\n]{0,120}' "$log" | tail -3
+      return 1
+    fi
+    if pgrep -f 'cicc|cc1plus|nvcc' >/dev/null 2>&1; then
+      waited=0
+      [ $((i % 6)) -eq 0 ] && say "JIT compiling FlashInfer kernels (nvcc/cicc active)... $((i*5))s"
+    else
+      waited=$((waited+5))
+      [ $((i % 6)) -eq 0 ] && say "still loading... $((i*5))s"
+    fi
+    if [ "$waited" -gt 600 ]; then
+      say "TIMEOUT: no compiler running and not healthy for 600s"
+      tail -5 "$log"
+      return 1
+    fi
+    sleep 5
+  done
+  say "TIMEOUT after 2400s"
+  tail -5 "$log"
+  return 1
+}
+
+cmd_stop() { if [ -f "$PIDFILE" ]; then kill $(cat "$PIDFILE") 2>/dev/null; rm -f "$PIDFILE"; say "supervisor off"; fi; say "stopping"; kill_all; say "stopped"; }
+
+cmd_status() {
+  local prof; prof=$(cat "$STATE" 2>/dev/null || echo unknown)
+  echo "profile : $prof"
+  if running_proc; then echo "process : RUNNING"; else echo "process : not running"; fi
+  if alive; then
+    echo "health  : OK ($HEALTH)"
+    curl -s --max-time 5 "http://127.0.0.1:${PORT}/v1/models" | python3 -c 'import json,sys; print("model   :", [m["id"] for m in json.load(sys.stdin)["data"]])' 2>/dev/null
+    local log; log=$(log_for "$prof")
+    grep -oE 'GPU KV cache size: [0-9,]+ tokens|max_total_num_tokens=[0-9]+' "$log" 2>/dev/null | tail -1 | sed 's/^/kv pool : /'
+  else
+    echo "health  : DOWN ($HEALTH)"
+  fi
+  nvidia-smi --query-gpu=index,memory.used,utilization.gpu,temperature.gpu --format=csv,noheader | sed 's/^/gpu     : /'
+  if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+    echo "superviz: ON (pid $(cat "$PIDFILE"))"
+  else
+    echo "superviz: off"
+  fi
+}
+
+cmd_logs() { tail -n "${1:-40}" "$(log_for "$(cat "$STATE" 2>/dev/null || echo unknown)")" 2>/dev/null || echo "no log"; }
+
+cmd_bench() {
+  python3 "$D/bench_gsq.py" 2>&1 | head -3
+}
+
+wait_vram_free() {
+  local i used
+  for i in $(seq 1 30); do
+    used=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | sort -rn | head -1)
+    [ "$used" -lt 500 ] && return 0
+    sleep 2
+  done
+  say "warn: vram still ${used} MiB after 60s"
+  return 0
+}
+
+cmd_supervise() {
+  local prof="${1:-vllm-dflash}"
+  echo $$ > "$PIDFILE"
+  say "supervisor on for $prof (pid $$)"
+  while true; do
+    if ! alive; then
+      say "health down -> clean restart of $prof"
+      kill_all
+      wait_vram_free
+      cmd_start "$prof" || say "restart attempt failed; retrying"
+    fi
+    sleep 20
+  done
+}
+
+case "${1:-status}" in
+  status) cmd_status ;;
+  start) shift; cmd_start "${1:-vllm-dflash}" ;;
+  stop) cmd_stop ;;
+  restart) shift; cmd_stop; cmd_start "${1:-vllm-dflash}" ;;
+  logs) shift; cmd_logs "${1:-40}" ;;
+  bench) cmd_bench ;;
+  supervise) shift; cmd_supervise "${1:-vllm-dflash}" ;;
+  *) sed -n '2,20p' "$0" ;;
+esac
