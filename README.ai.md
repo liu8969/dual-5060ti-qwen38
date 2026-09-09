@@ -22,7 +22,7 @@
 | vLLM | 0.28.0 | `~/vllm-venv/bin/python -c 'import vllm;print(vllm.__version__)'` |
 | flashinfer | 0.6.16.post3 | `~/vllm-venv/bin/python -c 'import flashinfer;print(flashinfer.__version__)'` |
 | Prebuilt kernels | `flashinfer-jit-cache==0.6.16.post3+cu130`, 959 modules | `~/vllm-venv/bin/python -c 'import flashinfer_jit_cache as m;print(m.get_jit_cache_dir())'` |
-| KV pool | 172,480 tokens | `modelctl status` |
+| KV pool | 170,280 tokens with prefix caching on (172,480 with it off) | `modelctl status` |
 | VRAM in use | ~15,600 MiB / card of 16,311 | `nvidia-smi` |
 | Install dir | `~/deploy-5060ti` | |
 | Logs | `~/modelctl-logs/{vllm-dflash,systemd,supervisor}.log` | |
@@ -50,7 +50,7 @@ vLLM 0.28.0
 
 | Parameter | Value | Why exactly this |
 |---|---|---|
-| `--kv-cache-memory` | `3865470566` | Pins the pool → deterministic **172,480 tokens**. Tuning `--gpu-memory-utilization` instead gives a smaller, jittery pool. This is the single most important knob. |
+| `--kv-cache-memory` | `3865470566` | Pins the pool → deterministic **170,280 tokens** with prefix caching on (172,480 off). Tuning `--gpu-memory-utilization` instead gives a smaller, jittery pool. This is the single most important knob. |
 | `--gpu-memory-utilization` | `0.977` | 0.985 and 0.99 both fail with `Engine core init failed`. 0.977 + pinned KV is the stable combination. |
 | `--max-num-batched-tokens` | `1024` | At 4096 the KV pool collapses from 4.3 GiB to 2.92 GiB and 150K raises `ValueError` (max 137,376). Do not raise it. |
 | `--max-num-seqs` | `4` | Measured optimum: C=4 → 255.5 tok/s aggregate at ~66 tok/s per stream. C=8 adds only 3.6% and queues half the requests. C=4 with `max-num-seqs 3` queues the 4th request and drops to 156 tok/s. |
@@ -58,10 +58,10 @@ vLLM 0.28.0
 | DFlash2 draft | 5 tokens | Accept length 3.46–4.77, acceptance 49–75%. MTP3 gives a bigger pool (247,150) but decodes at 73.2/58.3 tok/s — DFlash2 wins for interactive use. |
 | `--attention-backend` | `TRITON_ATTN` | Most stable on sm_120. |
 | `MAX_JOBS` | `2` | Each nvcc TU uses 2.5–3 GB RSS; 18 parallel nvcc OOM-kills a 32 GB host. |
-| `--no-enable-prefix-caching` | set | Prefix caching was disabled for stability with the hybrid (GDN) model; re-enable only with a benchmark before/after. |
+| `--enable-prefix-caching` | **on** | Costs 2,200 tokens of pool (172,480 → 170,280) but cuts TTFT on a repeated long prompt from 11.9 s to 0.7 s at 30K and from 49.5 s to 1.2 s at 90K (16.9× / 40.2×). Verify with `scripts/prefix_cache_test.py`. Was disabled during the first stability pass; seely with a benchmark before/after. |
 
 **KV pool vs concurrency**: the pool is shared. 4 streams average ~43K tokens each. Four simultaneous
-100K requests do **not** fit (400K > 172,480) — vLLM will preempt and recompute. For long-document
+100K requests do **not** fit (400K > 170,280) — vLLM will preempt and recompute. For long-document
 work use 1–2 streams.
 
 ## 3. Hard invariants

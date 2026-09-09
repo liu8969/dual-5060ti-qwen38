@@ -1,6 +1,6 @@
 # dual-5060ti-qwen38
 
-2× 16 GB 消费级 Blackwell 上跑 27B 模型，150K 上下文，KV 池 172,480 token。
+2× 16 GB 消费级 Blackwell 上跑 27B 模型，150K 上下文，KV 池 170,280 token（开前缀缓存）/ 172,480（关）。
 Serving a 27B model at 150K context on two 16 GB consumer Blackwell cards.
 
 ## Profile
@@ -10,7 +10,7 @@ Serving a 27B model at 150K context on two 16 GB consumer Blackwell cards.
 | **模型** | [Merkyor / Qwen3.8-27B-EfficientThink-…-DFlash2](https://huggingface.co/Merkyor/Qwen3.8-27B-EfficientThink-K3-Opus5-Grok4.6-GPT5.6Sol-SFT-SimPO-DFlash2) |
 | **量化** | NVFP4 W4A4（compressed-tensors，18.8 GB，9.3 GB/卡） |
 | **解码** | DFlash2 投机解码，草稿 `DFlash2-FP8`（2.4 GB），5 tokens/步，接受长度 3.46–4.77 |
-| **KV** | FP8，16 KB/token → 池 172,480 token |
+| **KV** | FP8，16 KB/token → 池 170,280 token（开前缀缓存） |
 | **上下文 / 并发** | 150,000 / 4 条流共享同一 KV 池 |
 | **吞吐** | 115.7 tok/s 单流 · 255.5 tok/s 聚合（C=4） |
 
@@ -55,7 +55,7 @@ bash bench.sh                 # 复现下面的数字
 
 | 指标 | 数值 |
 |---|---|
-| KV 池 | 172,480 token（150K 请求的 1.15×） |
+| KV 池 | 170,280 token（开前缀缓存；关闭时 172,480） |
 | 显存 | 15,597 MiB / 卡（共 16,311） |
 | 解码（短提示 49 token） | 115.7 tok/s（关思考）/ 79.1（开思考） |
 | 解码（长上下文 92K） | **33.5 tok/s** ⚠️ 见下 |
@@ -63,6 +63,7 @@ bash bench.sh                 # 复现下面的数字
 | TTFT @92K / @115K | 62.6 s / 91.8 s |
 | 并发聚合（短提示） | C=1 70.4 · C=2 149.4 · **C=4 255.5** · C=8 264.7 tok/s |
 | 长文召回 | 5/5 @96.6K；club 协议 2/2 @115K |
+| 前缀缓存 | 重复长提示 TTFT：30K 档 11.9s→0.7s（16.9×）· 90K 档 49.5s→1.2s（**40.2×**） |
 | 启动 / 崩溃恢复 | 66–200 s / 90 s |
 
 > ⚠️ **解码速度强烈依赖上下文长度**：短提示 115.7 tok/s，92K 上下文只有 33.5 tok/s（掉到 1/3.5）。
@@ -84,14 +85,14 @@ bash bench.sh                 # 复现下面的数字
 
 ## English
 
-Serve a 27B model at 150K context on 2× 16 GB consumer Blackwell — **172,480-token KV pool**.
+Serve a 27B model at 150K context on 2× 16 GB consumer Blackwell — **170,280-token KV pool** (172,480 with prefix caching off).
 
 | | |
 |---|---|
 | **Model** | [Merkyor / Qwen3.8-27B-EfficientThink-…-DFlash2](https://huggingface.co/Merkyor/Qwen3.8-27B-EfficientThink-K3-Opus5-Grok4.6-GPT5.6Sol-SFT-SimPO-DFlash2) |
 | **Quantization** | NVFP4 W4A4 (compressed-tensors), 18.8 GB |
 | **Decode** | DFlash2 speculative decoding, `DFlash2-FP8` draft, 5 tokens/step, accept length 3.46–4.77 |
-| **KV** | FP8, 16 KB/token → 172,480-token pool |
+| **KV** | FP8, 16 KB/token → 170,280-token pool |
 | **Context / concurrency** | 150,000 / 4 streams sharing one pool |
 | **Throughput** | 115.7 tok/s single stream · 255.5 tok/s aggregate at C=4 |
 

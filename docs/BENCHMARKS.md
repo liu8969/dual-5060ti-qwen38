@@ -18,7 +18,8 @@ different prompts, token limits, or cold/warm states.
 ## 1. Production config / 生产配置
 
 ```
---kv-cache-memory 3865470566        # pinned, -> 172,480 tokens
+--kv-cache-memory 3865470566        # pinned -> 170,280 tokens (172,480 with prefix caching off)
+--enable-prefix-caching             # repeated long prompt: TTFT 49.5s -> 1.2s at 90K
 --max-num-batched-tokens 1024
 --gpu-memory-utilization 0.977
 --max-num-seqs 4
@@ -32,7 +33,7 @@ different prompts, token limits, or cold/warm states.
 
 | Metric | Value |
 |---|---|
-| KV pool | **172,480 tokens** (1.15× a 150K request) |
+| KV pool | **170,280 tokens** with prefix caching (172,480 without) |
 | VRAM | 15,459–15,517 MiB / card of 16,384 |
 | Single stream (thinking off) | **115.7 tok/s** (3 runs: 115.6 / 115.7 / 115.7) |
 | Single stream (thinking on) | **79.1 tok/s** (3 runs: 79.2 / 79.1 / 79.1) |
@@ -151,3 +152,19 @@ Running the **upstream** runner on vLLM yields the same pass/fail verdicts but
 `decode_tok_s: null` — it reads llama.cpp's `response["timings"]`, which vLLM does not emit — so it
 reports `NOT USEFUL` even when every check passes. The adapter's deviations (streaming SSE metrics;
 context ceiling from `/v1/models.max_model_len`) are recorded in each receipt's `policy.deviations`.
+
+## 10. Prefix caching / 前缀缓存
+
+Measured with [`scripts/prefix_cache_test.py`](../scripts/prefix_cache_test.py): the **same** long prompt
+sent twice in a row (no nonce, so the second request can reuse the prefix).
+
+| Prompt context | Cold TTFT | Cached TTFT | Speedup | Prefill cold → cached |
+|---|---|---|---|---|
+| 30K | 11.888 s | 0.703 s | **16.9×** | 2,524 → 42,679 tok/s |
+| 90K | 49.512 s | 1.233 s | **40.2×** | 1,818 → 72,993 tok/s |
+
+- Cost: the KV pool shrinks from 172,480 to **170,280** tokens (−1.3%) because prefix hashing needs
+  its own bookkeeping. Server-reported `Prefix cache hit rate` reached 48% during the test window.
+- The gain scales with context length — exactly the long-document / repeated-system-prompt case.
+- All protocol receipts in §9 were taken **with prefix caching disabled** (pool 172,480). Re-running
+  the 131K tier with caching on would only change the first (cold) request of each shape.

@@ -8,7 +8,7 @@
 
 ## 0. 最重要的事（先看这 8 条）
 
-1. **KV 池用 `--kv-cache-memory` 硬钉，不要靠调 `--gpu-memory-utilization`**。钉住后池子确定性拿到 172,480；调 util 反而在 0.985/0.99 时 `Engine core init failed`。
+1. **KV 池用 `--kv-cache-memory` 硬钉，不要靠调 `--gpu-memory-utilization`**。钉住后池子确定性拿到 170,280（关前缀缓存时 172,480）；调 util 反而在 0.985/0.99 时 `Engine core init failed`。
 2. **`--max-num-batched-tokens` 保持 1024**。设 4096 会让 KV 从 4.3 GiB 掉到 2.92 GiB，150K 直接 `ValueError`。
 3. **别改 systemd 单元的 `CUDA_HOME`**。FlashInfer 的 JIT 缓存 key 含 nvcc 完整路径，一改就全套重编译 5–10 分钟。
 4. **启动慢 ≠ 权重加载慢**。权重 2 秒读完（page cache），45–200 秒全花在 torch.compile / cudagraph 上；fastsafetensors / runai_streamer / tensorizer 都帮不上忙。
@@ -86,7 +86,8 @@
 
 ```
 vLLM 0.28.0 + Merkyor W4A4 + DFlash2 + FP8 KV
---kv-cache-memory 3865470566      # 硬钉 3.6 GiB → 池 172,480
+--kv-cache-memory 3865470566      # 硬钉 3.6 GiB → 池 170,280（关前缀缓存 172,480）
+--enable-prefix-caching           # 重复长提示 TTFT 90K 档 49.5s → 1.2s
 --max-num-batched-tokens 1024     # 不能调大
 --gpu-memory-utilization 0.977
 --max-num-seqs 4                  # 并发甜点
@@ -141,6 +142,7 @@ vLLM 0.28.0 + Merkyor W4A4 + DFlash2 + FP8 KV
 | 守护进程重启后仍挂 | 崩溃后没等显存排空就重启，第一次必然 OOM | 加 `wait_vram_free()`：轮询到两卡 < 500 MiB 再启动 |
 | **无限自杀循环**（本次最严重） | `cmd_start` 等待上限 360 秒，而 JIT 编译要 5–10 分钟 → 超时 → 守护判定"进程死了" → `kill_all` → 重启 → 编译从头再来 | 改成**编译感知等待**：检测到 `nvcc/cicc` 就不计时，上限 2400 秒 |
 | 编译永远完不成 | 我给 systemd 单元加了 `CUDA_HOME`，nvcc 路径从 `/usr/local/cuda-13.3/bin` 变成 `/usr/local/cuda/bin`，JIT 缓存 key 失效 | 钉死 `CUDA_HOME`；装预编译轮子彻底消除编译 |
+| 重复长提示每次都重新预填充（TTFT 49.5s） | 配置里写的是 `--no-enable-prefix-caching` | 改成 `--enable-prefix-caching`：30K 档 11.9s→0.7s、90K 档 49.5s→1.2s；代价是 KV 池 172,480→170,280 |
 | 误报"在编译" | `pgrep -f "cicc|cc1plus"` 匹配到父 shell 的命令行 | 用 `[c]icc|[c]c1plus`，或看缓存目录有无新 `.o` |
 
 ### 6.2 现在正确的方式

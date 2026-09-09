@@ -176,7 +176,9 @@ maximum-context pick.
   DFlash2 row is clean.
 - **Model source differs** from the published preset (`Merkyor W4A4` vs `unsloth/Qwen3.8-27B-NVFP4`).
 - No matched 8K / 32K rows yet.
-- `--no-enable-prefix-caching` was kept for stability with the hybrid (GDN) model.
+- **Prefix caching is now ON** (added after the receipts above were taken): KV pool 170,280
+  instead of 172,480, and a repeated long prompt goes from 49.5 s TTFT to 1.2 s at 90K (40.2×).
+  The receipts in this submission were measured with it disabled.
 - FlashInfer kernels are prebuilt (`flashinfer-jit-cache`), so no JIT compilation at startup;
   startup is 66–200 s (cudagraph capture).
 
