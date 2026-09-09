@@ -76,27 +76,57 @@ vllm serve "$MODEL" \
 - MTP/speculative settings: `DFlash2 draft, num_speculative_tokens=5, draft TP=2; measured accept length 3.46–4.77 (acceptance 49–75%)`
 - Thinking/reasoning: `both measured (off / on)`
 - Batch size / ubatch size: `max-num-batched-tokens 1024, max-num-seqs 4`
-- Prompt set(s): `short code prompt (EN), 100K needle (5 markers at 5/25/50/75/95%), concurrency sweep C=1/2/4/8`
+- Prompt set(s): `short code prompt (EN), 100K needle, concurrency sweep C=1/2/4/8, and the club high-context profile at the 131K tier`
 - Runs / warmups: `3 warm runs; first request after startup discarded`
-- Stream mode: `non-streamed` ⚠️ *differs from the club protocol*
+- Stream mode: `streamed for the protocol receipt (SSE), non-streamed for the earlier ad-hoc runs`
 
 ### Speed / Accuracy Details
 
-- Prefill tok/s: `1,396` at 96,588 prompt tokens
-- Decode tok/s: `115.7` (thinking off; runs 115.6 / 115.7 / 115.7), `79.1` (thinking on)
-- End-to-end tok/s: `unknown`
-- TTFT/latency: `not measured (non-streamed client)` ⚠️
+- Prefill tok/s: `1,466` @92K · `1,257` @115K prompt tokens
+- Decode tok/s: `115.7` short prompt (49 tokens, thinking off; runs 115.6/115.7/115.7), `79.1` (thinking on)
+- **Decode tok/s at 92K context: `31.3 – 35.6`** ⚠️ see below
+- TTFT: `62.6 s` @92K · `91.8 s` @115K (streaming client)
 - Reported KV pool: `172,480 tokens` (`GPU KV cache size` from vLLM)
 - VRAM in use: `~15,600 MiB / card`
-- Retrieval: `5/5` needles at ~96.6K prompt tokens
+- Retrieval: `5/5` needles at ~96.6K (ad-hoc); club protocol `2/2` at 115.4K
 - Concurrency aggregate: `C=1 70.4 · C=2 149.4 · C=4 255.5 · C=8 264.7 tok/s` (shared paged KV pool, per-stream ~66–69 tok/s at C=4)
+
+### club-5060ti high-context profile, 131K tier — `USEFUL`
+
+Ran the upstream runner first, then a vLLM adapter of it (same workload, same checks; the upstream
+runner reads llama.cpp's `response["timings"]`, so on vLLM it reports `decode_tok_s: null` and can
+only conclude `NOT USEFUL` even when every check passes).
+
+| Case | Prompt tokens | TTFT | Prefill | Decode | Pass |
+|---|---|---|---|---|---|
+| retrieval ×2 | 115,406 / 115,409 | 91.84 s | 1,256.6 tok/s | — | ✅ |
+| sustained ×2 | 91,828 | 62.63 s | 1,466.3 tok/s | 35.6 / 31.3 tok/s | ✅ |
+
+- Upstream runner result: retrieval 2/2 ✅, sustained 2/2 ✅, prompt coverage ✅, `useful: false`
+  only because `median_sustained_decode_tok_s` is `null`.
+- Adapter result: `useful: true`, median decode **33.45 tok/s**, median prefill **1,361 tok/s**,
+  median TTFT **77.2 s**.
+- Adapter deviations, both recorded in the receipt: streaming SSE metrics, and the context ceiling
+  read from `/v1/models.max_model_len` instead of llama.cpp's `status.args`.
+
+### The number worth publishing: decode scales with context, not just hardware
+
+| Prompt context | Decode tok/s |
+|---|---|
+| 49 tokens | **115.7** |
+| 92K tokens | **31.3 – 35.6** |
+
+A 3.5× collapse. The short-prompt figure is what everyone quotes (including our own earlier notes),
+and it is misleading for long-document work. This is exactly the failure mode the club protocol's
+92K sustained-generation check exists to expose — it is the most useful thing we can contribute.
 
 ### Matched MTP3 vs DFlash2 (the row the repo asks for)
 
 Same machine, same model, same quant, same `--kv-cache-dtype fp8`, same `--kv-cache-memory`,
-only the speculative method differs:
+only the speculative method differs. Measured with the short prompt; a matched 92K-context row is
+still pending:
 
-| Speculative | KV pool | Decode off/on (tok/s) | Accept |
+| Speculative | KV pool | Decode off/on, short prompt (tok/s) | Accept |
 |---|---|---|---|
 | MTP n=3 | **247,150** | 73.2 / 58.3 | — |
 | **DFlash2 n=5** | 172,480 | **115.7 / 79.1** | 3.46–4.77 (49–75%) |
