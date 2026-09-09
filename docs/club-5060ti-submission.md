@@ -97,28 +97,45 @@ Ran the upstream runner first, then a vLLM adapter of it (same workload, same ch
 runner reads llama.cpp's `response["timings"]`, so on vLLM it reports `decode_tok_s: null` and can
 only conclude `NOT USEFUL` even when every check passes).
 
-| Case | Prompt tokens | TTFT | Prefill | Decode | Pass |
-|---|---|---|---|---|---|
-| retrieval ×2 | 115,406 / 115,409 | 91.84 s | 1,256.6 tok/s | — | ✅ |
-| sustained ×2 | 91,828 | 62.63 s | 1,466.3 tok/s | 35.6 / 31.3 tok/s | ✅ |
+**All four reachable tiers** (the 204K+ tiers exceed this server's `max_model_len 150000`):
 
-- Upstream runner result: retrieval 2/2 ✅, sustained 2/2 ✅, prompt coverage ✅, `useful: false`
-  only because `median_sustained_decode_tok_s` is `null`.
-- Adapter result: `useful: true`, median decode **33.45 tok/s**, median prefill **1,361 tok/s**,
-  median TTFT **77.2 s**.
-- Adapter deviations, both recorded in the receipt: streaming SSE metrics, and the context ceiling
-  read from `/v1/models.max_model_len` instead of llama.cpp's `status.args`.
+| Tier | Retrieval | Sustained (generated / decode tok/s) | Verdict |
+|---|---|---|---|
+| 32K | ✅ 2/2 (28.9K prompt) | 1,939 / 70.5 ✅ · 936 / 66.6 ❌ | NOT USEFUL |
+| 65K | ✅ 2/2 (57.7K prompt) | 1,287 / 50.2 ✅ · 1,024 / 45.1 ❌ | NOT USEFUL |
+| 98K | 1/2 ❌ (86.6K prompt) | 1,461 / 41.6 ✅ · 1,084 / 37.3 ✅ | NOT USEFUL |
+| **131K** | ✅ 2/2 (115.4K prompt) | 1,782 / 35.6 ✅ · 1,260 / 31.3 ✅ | **USEFUL** |
+
+131K tier detail: retrieval TTFT 91.84 s, prefill 1,256.6 tok/s; sustained TTFT 62.63 s, prefill
+1,466.3 tok/s. Median decode **33.45 tok/s**, median prefill **1,361 tok/s**, median TTFT **77.2 s**.
+
+Failure modes, reported as-is because they are findings:
+
+- **32K / 65K**: the answer stopped after 936 / 1,024 tokens, below the protocol's 1,076-token
+  sustained floor — while the first repeat of the same tier passed (1,939 / 1,287). Answer length is
+  stochastic on this prompt, so the tier verdict is close to a coin flip.
+- **98K**: the second retrieval returned `CLUB-5060` — the correct needle truncated after 8 tokens
+  (full needle `CLUB-5060TI-HIGH-CONTEXT-NEEDLE-48291`). An intermittent exact-match miss worth
+  watching; possibly a speculative-decoding stop-condition artifact.
+- **Upstream runner on vLLM**: same pass/fail verdicts, `useful: false` only because
+  `median_sustained_decode_tok_s` is `null`. Adapter deviations are recorded in each receipt's
+  `policy.deviations`: streaming SSE metrics, and the context ceiling read from
+  `/v1/models.max_model_len` instead of llama.cpp's `status.args`.
 
 ### The number worth publishing: decode scales with context, not just hardware
 
 | Prompt context | Decode tok/s |
 |---|---|
 | 49 tokens | **115.7** |
-| 92K tokens | **31.3 – 35.6** |
+| 23K | 68.6 |
+| 46K | 47.7 |
+| 69K | 39.5 |
+| 92K | **33.5** |
 
-A 3.5× collapse. The short-prompt figure is what everyone quotes (including our own earlier notes),
-and it is misleading for long-document work. This is exactly the failure mode the club protocol's
-92K sustained-generation check exists to expose — it is the most useful thing we can contribute.
+A 3.5× collapse. Prefill degrades too (2,619 → 1,257 tok/s from 29K to 115K), and TTFT is close to
+linear (11.0 s → 91.8 s). The short-prompt figure is what everyone quotes (including our own earlier
+notes) and it is misleading for long-document work. This is exactly the failure mode the protocol's
+92K sustained-generation check exists to expose — the most useful thing we can contribute.
 
 ### Matched MTP3 vs DFlash2 (the row the repo asks for)
 

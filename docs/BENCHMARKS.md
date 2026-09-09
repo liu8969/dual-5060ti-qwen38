@@ -106,31 +106,48 @@ startup is 10–20% slower (cudagraph / autotune warm-up).
 The single number everyone quotes (115.7 tok/s) is a **short-prompt** figure. Decode collapses as
 context grows, because the draft model's acceptance drops and every step scans a longer KV cache:
 
-| Context in prompt | Decode tok/s | How measured |
+| Prompt context | Decode tok/s | Source |
 |---|---|---|
 | 49 tokens | **115.7** | `bench_gsq.py`, 512-token generation |
-| 92K tokens | **31.3 – 35.6** | club-5060ti protocol, 3,072-token budget, 1,260–1,782 generated |
+| 23K | 68.6 | club protocol, sustained |
+| 46K | 47.7 | club protocol, sustained |
+| 69K | 39.5 | club protocol, sustained |
+| 92K | **33.5** | club protocol, sustained |
 
-Prefill also degrades mildly with context: 1,466 tok/s at 92K vs 1,257 tok/s at 115K.
+Prefill degrades too: 2,619 tok/s @29K → 1,932 @58K → 1,522 @87K → 1,257 @115K.
+TTFT is close to linear in prompt length: 11.0 s @29K → 29.9 s @58K → 56.9 s @87K → 91.8 s @115K.
 
 **Always quote decode with its context length.** A 115.7 tok/s claim without "49-token prompt" is
-misleading for long-document workloads.
+misleading for long-document workloads — this is a 3.5× difference.
 
-## 9. club-5060ti protocol receipt — 131K tier / 官方协议 131K 档
+## 9. club-5060ti protocol — all four reachable tiers / 官方协议四档实测
 
-Run with [`scripts/club_receipt_vllm.py`](../scripts/club_receipt_vllm.py) (a vLLM adapter that keeps
-the upstream workload and pass/fail rules identical — same needle, same filler, same unique request
-nonce, same calibration, same 2×512 retrieval and 2×3,072 sustained budgets).
+Run with [`scripts/club_receipt_vllm.py`](../scripts/club_receipt_vllm.py): a vLLM adapter that keeps
+the upstream workload and pass/fail rules identical (same needle, same filler, same unique request
+nonce, same calibration, same 2×512 retrieval and 2×3,072 sustained budgets, same ≥1,076 generated /
+≥800 visible-character floor).
 
-| Case | Prompt tokens | TTFT | Prefill | Decode | Pass |
-|---|---|---|---|---|---|
-| retrieval ×2 | 115,406 / 115,409 | 91.84 s | 1,256.6 tok/s | — | ✅ |
-| sustained ×2 | 91,828 | 62.63 s | 1,466.3 tok/s | 35.6 / 31.3 tok/s | ✅ |
+| Tier | Retrieval | Sustained (gen / decode tok/s) | Verdict |
+|---|---|---|---|
+| 32K | ✅ 2/2 (28.9K) | 1,939 / 70.5 ✅ · 936 / 66.6 ❌ | NOT USEFUL |
+| 65K | ✅ 2/2 (57.7K) | 1,287 / 50.2 ✅ · 1,024 / 45.1 ❌ | NOT USEFUL |
+| 98K | 1/2 ❌ (86.6K) | 1,461 / 41.6 ✅ · 1,084 / 37.3 ✅ | NOT USEFUL |
+| **131K** | ✅ 2/2 (115.4K) | 1,782 / 35.6 ✅ · 1,260 / 31.3 ✅ | **USEFUL** |
 
-Summary: `useful: true`, retrieval 2/2, sustained 2/2, prompt coverage ✅,
-median decode **33.45 tok/s**, median prefill **1,361 tok/s**, median TTFT **77.2 s**.
+Why the lower tiers are "not useful" — both failure modes are honest findings, not context failures:
 
-Deviations from the upstream runner (both documented in the receipt):
-`metrics` come from the streaming SSE stream (upstream reads llama.cpp's `response["timings"]`,
-which vLLM does not emit), and the context ceiling is read from `/v1/models.max_model_len`
-(upstream reads llama.cpp's `status.args --ctx-size/--parallel`).
+- **32K / 65K**: the model's answer stopped after 936 / 1,024 tokens, below the protocol's
+  1,076-token sustained-generation floor. The first repeat of the same tier passed (1,939 / 1,287).
+  Answer length is stochastic on this prompt; the tier verdict is a coin flip.
+- **98K**: the second retrieval returned `CLUB-5060` — the correct needle **truncated after 8 tokens**
+  (the full needle is `CLUB-5060TI-HIGH-CONTEXT-NEEDLE-48291`). An intermittent exact-match miss
+  worth watching, possibly a speculative-decoding stop-condition artifact.
+
+131K tier detail: retrieval 2/2 at 115,406 / 115,409 prompt tokens (TTFT 91.84 s, prefill 1,256.6
+tok/s); sustained 2/2 at 91,828 prompt tokens (TTFT 62.63 s, prefill 1,466.3 tok/s, decode 35.6 /
+31.3 tok/s). Median decode **33.45 tok/s**, median prefill **1,361 tok/s**, median TTFT **77.2 s**.
+
+Running the **upstream** runner on vLLM yields the same pass/fail verdicts but
+`decode_tok_s: null` — it reads llama.cpp's `response["timings"]`, which vLLM does not emit — so it
+reports `NOT USEFUL` even when every check passes. The adapter's deviations (streaming SSE metrics;
+context ceiling from `/v1/models.max_model_len`) are recorded in each receipt's `policy.deviations`.
