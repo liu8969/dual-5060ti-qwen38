@@ -285,3 +285,54 @@ Two clean curves, both roughly ∝ 1/(1 + context/const):
 | `stream=True` | **only `speculative_decoding`** — the timing fields are not emitted mid-stream |
 
 So: read acceptance from either mode, but read server-side TTFT/ITL only from a non-streaming call.
+
+## 15. llama.cpp: context sweep and DFlash / llama.cpp 的上下文衰减与 DFlash
+
+Machine: 2x RTX 5060 Ti, `Qwen3.8-27B-GSQ-RCO-IQ3_S.gguf` (11.77 GB) + `DFlash2-Q4_K_M.gguf` draft,
+`--cache-type-k/v q8_0`, `--ctx-size 262144`, `--split-mode layer`, one slot, thinking off,
+256-token generations with a unique leading nonce (cold prefill).
+Numbers below are llama.cpp's **native** `timings` (`prompt_per_second` / `predicted_per_second`).
+
+### 15.1 Prefill and decode vs context
+
+| Context | Actual prompt | TTFT | Prefill tok/s | Decode tok/s | Draft accepted |
+|---|---|---|---|---|---|
+| 8K | 8,181 | 7.90 s | 1,079.2 | 66.2 | 18/26 |
+| 16K | 16,366 | 15.75 s | 1,067.1 | 62.1 | 18/26 |
+| 32K | 32,760 | 33.09 s | 1,010.8 | 57.0 | 18/26 |
+| 64K | 65,517 | 74.03 s | 898.8 | 39.4 | 17/32 |
+| 96K | 98,279 | 123.43 s | 806.2 | 41.1 | 19/26 |
+| 128K | 131,064 | 178.40 s | 735.5 | 36.5 | 18/23 |
+
+Prefill decays **1.47×**, decode **1.81×** from 8K to 128K — markedly flatter than vLLM's 2.9×/2.6×.
+
+### 15.2 Head to head: vLLM (K=10) vs llama.cpp (DFlash2)
+
+| Context | vLLM prefill | llama.cpp prefill | vLLM ÷ llama | vLLM decode | llama.cpp decode | vLLM ÷ llama |
+|---|---|---|---|---|---|---|
+| 8K | 3,356.8 | 1,079.2 | **3.11×** | 149.9 | 66.2 | **2.26×** |
+| 16K | 2,992.2 | 1,067.1 | 2.80× | 134.1 | 62.1 | 2.16× |
+| 32K | 2,435.9 | 1,010.8 | 2.41× | 114.8 | 57.0 | 2.01× |
+| 64K | 1,768.8 | 898.8 | 1.97× | 86.6 | 39.4 | 2.20× |
+| 96K | 1,388.0 | 806.2 | 1.72× | 69.2 | 41.1 | 1.68× |
+| 128K | 1,143.3 | 735.5 | **1.55×** | 57.9 | 36.5 | **1.59×** |
+
+**vLLM's advantage shrinks from 3.1× to 1.55× as context grows.** At short context vLLM wins on
+scheduling and batching; at long context both engines converge because the work becomes
+KV-bandwidth bound and the engine overhead stops mattering. TTFT at 128K: 114.6 s (vLLM) vs 178.4 s
+(llama.cpp).
+
+### 15.3 Does DFlash help llama.cpp? Yes, a lot — but it costs prefill
+
+Matched baseline: same model, same q8_0 KV, same 262144 ctx, same build, only speculative decoding
+removed (`--spec-type ngram-map-k4v,draft-dflash` dropped entirely).
+
+| Context | Decode, no spec | Decode, DFlash2 | Change | Prefill, no spec | Prefill, DFlash2 | Change |
+|---|---|---|---|---|---|---|
+| 8K | 29.1 | **66.2** | **+127%** | 1,334.4 | 1,079.2 | −19% |
+| 32K | 25.5 | **57.0** | **+124%** | 1,278.8 | 1,010.8 | −21% |
+| 64K | 22.0 | **39.4** | **+79%** | 1,142.2 | 898.8 | −21% |
+
+So on llama.cpp the draft model buys **2.2× decode** and costs **~20% prefill** — a clear win for any
+interactive or generation-heavy workload, a loss for pure "read one document and answer briefly".
+The gain narrows as context grows (127% → 79%), consistent with acceptance falling at long context.

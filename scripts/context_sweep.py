@@ -54,6 +54,7 @@ def stream_once(base_url, model, prompt, max_tokens, timeout=1800):
     n_stream = 0
     usage = {}
     server_metrics = {}
+    response_timings = {}
     with urllib.request.urlopen(req, timeout=timeout) as response:
         for raw in response:
             line = raw.decode("utf-8", "replace").strip()
@@ -70,6 +71,8 @@ def stream_once(base_url, model, prompt, max_tokens, timeout=1800):
                 usage = chunk["usage"]
             if chunk.get("metrics"):
                 server_metrics = chunk["metrics"]
+            if chunk.get("timings"):
+                response_timings = chunk["timings"]
             for choice in chunk.get("choices") or []:
                 delta = choice.get("delta") or {}
                 if delta.get("content") or delta.get("reasoning_content"):
@@ -79,17 +82,22 @@ def stream_once(base_url, model, prompt, max_tokens, timeout=1800):
                     last = now
                     n_stream += 1
     wall = time.monotonic() - t0
-    pt = usage.get("prompt_tokens")
+    timings = response_timings or {}          # llama.cpp returns native timings
+    pt = usage.get("prompt_tokens") or timings.get("prompt_n")
     ct = usage.get("completion_tokens") or n_stream
     decode_window = (last - t0 - ttft) if (last and ttft) else None
     return {
         "prompt_tokens": pt,
-        "completion_tokens": ct,
+        "completion_tokens": ct or timings.get("predicted_n"),
         "ttft_s": round(ttft, 3) if ttft else None,
         "wall_s": round(wall, 2),
         "client_prefill_tok_s": round(pt / ttft, 1) if pt and ttft else None,
         "client_decode_tok_s": (round(max(ct - 1, 0) / decode_window, 1)
                                 if decode_window and decode_window > 0 and ct > 1 else None),
+        "native_prefill_tok_s": timings.get("prompt_per_second"),
+        "native_decode_tok_s": timings.get("predicted_per_second"),
+        "native_draft_n": timings.get("draft_n"),
+        "native_draft_accepted": timings.get("draft_n_accepted"),
         "server_metrics": server_metrics,
     }
 
@@ -129,6 +137,12 @@ def main():
         sm = r.get("server_metrics") or {}
         sd = sm.get("speculative_decoding") or {}
         rows.append({"target": target, **r})
+        if r.get("native_prefill_tok_s"):
+            sm = {"time_to_first_token_ms": None}
+            emit(f"{'  native':>8} {'':>8} {'':>8} {r['native_prefill_tok_s']:>9.1f} "
+                 f"{r['native_decode_tok_s']:>8.1f}  (llama.cpp timings)"
+                 + (f"  draft {r['native_draft_accepted']}/{r['native_draft_n']}"
+                    if r.get('native_draft_n') else ""))
         emit(f"{target:>8} {str(r['prompt_tokens']):>8} {str(r['ttft_s']):>8} "
              f"{str(r['client_prefill_tok_s']):>9} {str(r['client_decode_tok_s']):>8} "
              f"{str(round(sm['time_to_first_token_ms'] / 1000, 3)) if sm.get('time_to_first_token_ms') else '-':>9} "

@@ -340,3 +340,14 @@ Triton kernel JIT compilation during inference: _prepare_dflash_inputs_kernel / 
 
 最后一条是 0.29 的 `jit_monitor` 新功能：投机解码的 4 个 Triton 内核在**首次推理时**才编译（一次性
 延迟尖峰）。可用 `--jit-monitor-mode error` 让它变成硬失败，或 `--jit-monitor-verbose` 看详情。
+
+### llama.cpp 侧的两个坑（2026-09-10 实测）
+
+1. **DFlash2 草稿 GGUF 需要新版 llama.cpp**：`llama.cpp/build/bin/llama`（version 0.1.0-dev）加载草稿时报
+   `done_getting_tensors: wrong number of tensors; expected 81, got 58` → 直接退出。
+   换 `llama.cpp-new/build/bin/llama`（0.4.0-dev）即可。**`launch-256k-dflash.sh` 的默认 BIN 是旧版**，
+   必须显式传 `BIN=~/llama.cpp-new/build/bin/llama`。
+2. **llama.cpp 的 `/health` 在模型加载中就返回 200**，但 `/v1/models` 还是 503 `{"error":"Loading model"}`。
+   等模型就绪要探测 `/v1/models` 里有没有 `data`/`models` 字段，只看 `/health` 会误判"已就绪"然后全盘失败。
+3. 顺带：脚本里 `$D`、`$MODELS` 这类变量在**外层**由 Mac 的 bash 展开时会变空（因为整条命令包在双引号里），
+   导致 `bash /launch-256k-dflash.sh: 没有那个文件或目录`。跨机执行一律**先写本地脚本再 sftp 上传**。
