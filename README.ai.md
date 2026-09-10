@@ -205,7 +205,26 @@ Never claim a fix without a measurement. Never report a benchmark from a cold st
 | `docs/BENCHMARKS.md` | archived measurements and stack comparisons |
 | `AGENTS.md` | condensed rules (this file is the full version) |
 
-## 11. Escalation
+## 11. Upgrading vLLM (and rolling back)
+
+The production venv is never modified in place. The active interpreter is a symlink:
+
+```bash
+ln -sfn ~/vllm-venv-029 ~/vllm-current     # switch
+ln -sfn ~/vllm-venv     ~/vllm-current     # rollback
+sudo systemctl restart modelctl            # either way
+```
+
+`modelctl` passes `VLLM_BIN=$HOME/vllm-current/bin/vllm`, and the launch script honours it.
+**After any switch, confirm the real interpreter path with `ps -eo args | grep '[v]llm serve'`** —
+an env var alone does nothing if the script hardcodes the path (this exact mistake happened once).
+
+Upgrade checklist: (1) new venv side by side, (2) install the **matching** `flashinfer-jit-cache`
+wheel for whatever flashinfer the new vLLM pins, (3) `vllm serve --help=all` to confirm every flag
+this deployment uses still exists, (4) restart, (5) verify health / KV pool / VRAM, (6) re-benchmark
+and compare against the numbers in §5. Current: vLLM 0.29.0 + flashinfer 0.6.18.
+
+## 12. Escalation
 
 If two consecutive restart attempts fail with **different** error signatures, stop retrying and
 report: the exact log tail, `nvidia-smi` output, `free -g`, the profile in use, and what you already

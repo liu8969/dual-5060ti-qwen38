@@ -248,3 +248,47 @@ https://gh-proxy.com/https://github.com/flashinfer-ai/flashinfer/releases/downlo
 | `deploy-5060ti/PITFALLS.md` | 本文档 |
 | `~/.dsh/skills/model-ops/SKILL.md` | DSH 技能：操作铁律 |
 | `~/.dsh/AGENTS.md` | 每次会话自动加载的规则 |
+
+---
+
+## 11. vLLM 0.28 → 0.29 升级实录（2026-09-10）
+
+### 结果
+
+| 指标 | 0.28.0 | 0.29.0 | 变化 |
+|---|---|---|---|
+| 单流（关/开思考） | 115.7 / 79.1 | **122.5 / 83.6** | +5.9% / +5.7% |
+| C=4 聚合 | 255.5 | **274.1** | +7.3% |
+| KV 池 | 170,280 | 170,280 | 不变 |
+| 100K 召回 | 5/5 | 5/5 | 不变 |
+
+### 升级路径（生产 venv 全程未动）
+
+```bash
+# 1. 并排建新 venv，不动生产
+uv venv --python 3.13 ~/vllm-venv-029
+uv pip install --python ~/vllm-venv-029/bin/python --index-url https://pypi.tuna.tsinghua.edu.cn/simple vllm==0.29.0
+# 2. 装匹配版本的预编译内核（关键！）
+uv pip install --python ~/vllm-venv-029/bin/python --no-deps flashinfer_jit_cache-0.6.18+cu130-*.whl
+# 3. 切换 = 重指符号链接 + 重启
+ln -sfn ~/vllm-venv-029 ~/vllm-current && sudo systemctl restart modelctl
+# 4. 回滚 = 一条命令
+ln -sfn ~/vllm-venv ~/vllm-current && sudo systemctl restart modelctl
+```
+
+### 踩的坑
+
+1. **flashinfer 版本会跟着变**：0.29.0 把 `flashinfer-python` 钉到 `==0.6.18`（原来是 0.6.16.post3）。
+   不换 jit-cache 轮子就会回落到现场编译（5–10 分钟）。新轮子 906 个模块，含 `fp4_gemm_cutlass_sm120`。
+2. **`uv --torch-backend=cu130` 不存在**：uv 0.8.4 只支持到 `cu128`。但 PyPI 上 torch 2.13.0 的默认构建
+   就是 `+cu130`（`torch-2.13.0.dist-info` 无本地版本后缀、无 `direct_url.json`），所以**直接省略该参数**即可。
+3. **GitHub 代理会限速**：`gh-proxy.com` 从 2.9 MB/s 掉到 199 KB/s（1.5 GB 要 75 分钟）。
+   实测更快的：`gh.ddlc.top`（27 MB/s）、`gh.xmly.dev`（27.8 MB/s）、`ghproxy.net`（23 MB/s）。
+4. **`VLLM_BIN` 环境变量不生效**：venv 里的 `vllm` 脚本 shebang 在创建时就写死了绝对路径，
+   而生产启动脚本原本硬编码 `exec ~/vllm-venv/bin/vllm` —— 传环境变量没用，必须把
+   `exec "${VLLM_BIN:-...}"` 写进脚本。**切换后务必 `ps` 确认真实解释器路径**，别以为改了配置就生效了。
+5. **0.29 的 `--help` 变了**：默认只列 Config Groups，要 `vllm serve --help=all` 才能 grep 到具体参数
+   （2008 行）。升级前用它逐个核对依赖的参数是否还在。
+6. **0.29 新行为**：首次推理会 JIT 编译 Triton 内核 `_prepare_dflash_inputs_kernel`（一次性，
+   第一个请求慢 10%）；启动日志会出现 `Add 4 padding layers, may waste at most 25.00% KV cache memory`
+   和 `max_num_scheduled_tokens is set to 1024 based on the speculative decoding settings` 警告——都是正常的。
