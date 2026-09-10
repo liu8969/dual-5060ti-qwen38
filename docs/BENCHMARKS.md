@@ -336,3 +336,32 @@ removed (`--spec-type ngram-map-k4v,draft-dflash` dropped entirely).
 So on llama.cpp the draft model buys **2.2× decode** and costs **~20% prefill** — a clear win for any
 interactive or generation-heavy workload, a loss for pure "read one document and answer briefly".
 The gain narrows as context grows (127% → 79%), consistent with acceptance falling at long context.
+
+## 16. Observing a real workload / 真实负载观测
+
+`modelctl watch --gpu` during the user's own long-context project (vLLM 0.29, K=10):
+
+```
+    time  run wait   prefill   decode    KV%  cache%  accept% preempt
+20:17:13    1    0       0.0     20.9   77.1    90.0     11.6       0
+20:17:23    1    0       0.0     19.5   77.1    90.0     10.2       0
+20:17:33    1    0       0.0     15.1   77.1    90.0      5.7       0
+20:17:53    1    0       0.0     17.9   77.7    90.0      8.6       0
+20:18:03    1    0       0.0     32.3   77.6    90.0     23.9       0
+         GPU0 100% 78W 15767MiB | GPU1 100% 78W 15767MiB
+```
+
+Engine's own log over the same period: `Avg prompt throughput: 0.0`, `Avg generation throughput:
+19.8-35.1`, `Running: 1`. Prefill and running match exactly; decode agrees in mean (20.9 vs 22.6, an
+8% gap from the 10 s window-boundary offset).
+
+Three things this view makes obvious that the headline benchmarks hide:
+
+1. **`prefill = 0.0` with a live request means the prompt was 100% prefix-cache hits.** The cumulative
+   cache rate was **90%** — 137,712 of 168,982 prompt tokens never had to be prefilled, which at the
+   8K-tier prefill rate (3,357 tok/s) is roughly 41 seconds of work avoided.
+2. **Decode in this real workload is 15-32 tok/s, not the 162 tok/s headline.** The workload is
+   long-context and free-form, so speculative acceptance is only 5-24% — versus 86% on code. This is
+   the single most important caveat when quoting a decode number.
+3. **GPUs sit at ~78 W of 180 W while showing 100% utilisation**, i.e. idle-waiting on memory rather
+   than computing. No amount of extra compute buys throughput here; only more concurrency does.

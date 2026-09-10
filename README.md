@@ -76,7 +76,9 @@ bash bench.sh                 # 复现下面的数字
 |---|---|
 | `install.sh` | 一键安装（幂等，支持 `DRY_RUN=1`） |
 | `bench.sh` | 基准测试 → `results/bench-<时间戳>.md` |
-| `scripts/modelctl` | 运维 CLI（status/start/stop/restart/logs/bench/supervise） |
+| `modelctl watch --gpu` | 盯住正在跑的负载：每 2 秒一行 prefill/decode/queue/KV/cache/accept |
+| `scripts/modelctl` | 运维 CLI（status/start/stop/restart/logs/bench/**watch**/supervise） |
+| `scripts/modelwatch.py` | **实时监控**：prefill / decode / 队列 / KV / 缓存命中 / 投机接受度，兼容 vLLM·SGLang·llama.cpp |
 | `README.ai.md` | **给 AI 的详细手册**（参数原理、诊断树、失败签名、运维规程） |
 | `AGENTS.md` | 给 AI 的硬规则摘要 |
 | `docs/PITFALLS.md` | 踩坑全集 |

@@ -95,6 +95,7 @@ bash ~/deploy-5060ti/modelctl stop                    # also stops the superviso
 bash ~/deploy-5060ti/modelctl restart vllm-dflash
 bash ~/deploy-5060ti/modelctl logs 80
 bash ~/deploy-5060ti/modelctl bench                   # short decode test
+bash ~/deploy-5060ti/modelctl watch --gpu             # live prefill/decode/queue/cache/acceptance
 bash <repo>/bench.sh                                  # full suite → results/bench-<ts>.md
 sudo systemctl status|restart modelctl                # systemd layer
 tail -20 ~/modelctl-logs/systemd.log
@@ -143,6 +144,39 @@ grep -oE 'CUDA out of memory[^)]*|ValueError[^\n]{0,160}|RuntimeError[^\n]{0,160
 | `CUDA out of memory. Tried to allocate …` at cudagraph capture | pool computed too large | keep `--kv-cache-memory` pinned, do not raise util |
 | `Killed` with no traceback | host RAM OOM during compilation | `MAX_JOBS=2` |
 | VRAM rises to ~15 GB then drops to 0, repeatedly | two instances fighting | `modelctl stop`, then start once |
+
+## 5b. Watching a live workload (`modelwatch`)
+
+`modelctl watch [--gpu] [--interval N] [--json] [--once]` runs `scripts/modelwatch.py`: it scrapes the
+engine's **Prometheus endpoint** and diffs the counters, so one tool covers all three engines and the
+numbers do not depend on any engine's log format.
+
+| Meaning | vLLM | SGLang | llama.cpp |
+|---|---|---|---|
+| prefill tokens | `vllm:prompt_tokens_total` | `sglang:prompt_tokens_total` | `llamacpp:prompt_tokens_total` |
+| decode tokens | `vllm:generation_tokens_total` | `sglang:generation_tokens_total` | `llamacpp:tokens_predicted_total` |
+| running / queued | `num_requests_running/waiting` | `num_running_reqs` / `num_queue_reqs` | `requests_processing` / `requests_deferred` |
+| KV usage | `kv_cache_usage_perc` | `token_usage` | `kv_cache_usage_ratio` |
+| cache hit | `prefix_cache_hits_total ÷ queries_total` | `cache_hit_rate` gauge | — |
+| speculation | `spec_decode_num_accepted_tokens_total ÷ ..._draft_tokens_total` | — | — |
+
+Reading the output:
+
+- **`prefill = 0.0` while a request is running is not "no data" — it means every prompt token came
+  from the prefix cache.** On a cache-friendly workload this is the normal steady state and it is the
+  single clearest signal that prefix caching is doing the work.
+- `cache%` is **cumulative since server start** (`hits_total / queries_total`). The engine's own log
+  line reports a *per-10-second-window* rate, which legitimately reads `0.0%` whenever that window was
+  idle. Never quote the log's window value as "the cache hit rate".
+- `accept%` is the windowed speculative acceptance. It is strongly task-dependent — 86-94% on code,
+  ~40-52% on summarisation, and lower still on long-context free-form work — so never compare two
+  `accept%` values measured on different prompts.
+- `[-]` for the first tick is correct: a rate needs two samples.
+- Engines with `--metrics` off (llama.cpp default) fail detection explicitly rather than silently
+  showing zeros.
+
+Verified against the engine's own accounting: `prefill` and `running` match exactly, and `decode`
+agrees in both level and mean (the residual gap is the 10 s window boundary offset).
 
 ## 6. Prebuilt kernels (removes the 5–10 minute compile)
 

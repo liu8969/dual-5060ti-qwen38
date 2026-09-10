@@ -23,6 +23,7 @@ only the part an agent must never get wrong.
 
 ```bash
 bash ~/deploy-5060ti/modelctl status | start vllm-dflash | stop | logs 80 | bench
+bash ~/deploy-5060ti/modelctl watch --gpu    # live prefill/decode, works on vLLM/SGLang/llama.cpp
 sudo systemctl restart modelctl
 bash <repo>/bench.sh          # full suite → results/bench-<ts>.md
 ```
