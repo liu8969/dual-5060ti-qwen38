@@ -246,3 +246,42 @@ Also seen and benign: `Add 2/4 padding layers, may waste at most 4.17% / 25.00% 
 selects `align` automatically for this hybrid model when prefix caching is on
 (`Mamba cache mode is set to 'align' for Qwen3_5ForConditionalGeneration by default when prefix
 caching is enabled`). No measured benefit from overriding it, so the default is kept.
+
+## 14. Context sweep — prefill and decode vs prompt length / 上下文扫描
+
+Measured with [`scripts/context_sweep.py`](../scripts/context_sweep.py): one **cold** request per tier,
+each prompt leading with a unique nonce so prefix caching cannot turn it into a cache hit.
+Production config (vLLM 0.29, DFlash2 K=10, prefix caching on, `max_tokens 256`, thinking off).
+
+| Context | Actual prompt | TTFT | Prefill tok/s | Decode tok/s | Mean accept length | Acceptance |
+|---|---|---|---|---|---|---|
+| 8K | 8,182 | 2.44 s | **3,356.8** | **149.9** | 5.00 | 40.0% |
+| 16K | 16,366 | 5.47 s | 2,992.2 | 134.1 | 5.00 | 40.0% |
+| 32K | 32,758 | 13.45 s | 2,435.9 | 114.8 | 5.00 | 40.0% |
+| 64K | 65,516 | 37.04 s | 1,768.8 | 86.6 | 5.00 | 40.0% |
+| 96K | 98,280 | 70.81 s | 1,388.0 | 69.2 | 6.25 | 52.5% |
+| 128K | 131,060 | 114.64 s | 1,143.3 | 57.9 | 6.25 | 52.5% |
+
+Two clean curves, both roughly ∝ 1/(1 + context/const):
+
+- **Prefill degrades 2.9×** from 8K (3,357 tok/s) to 128K (1,143 tok/s).
+- **Decode degrades 2.6×** from 149.9 tok/s to 57.9 tok/s.
+- **TTFT is close to linear in prompt length** (2.4 s → 114.6 s), which is what lets you predict
+  interactive latency from the prompt size alone.
+- Acceptance is *task-dependent*: this summarisation prompt sits at 40% up to 64K and 52.5% beyond.
+  The code prompt in §11 reached **86-94%**. Decode speed therefore depends on the task as much as on
+  the context length — always report the prompt shape with the number.
+
+> The 92K figure in §8 (33.5 tok/s) was measured at K=5 with the club protocol's long creative
+> generation (1,260-1,782 tokens). This table uses K=10 and a 256-token summarisation task, hence
+> 69.2 tok/s at 96K. Both are correct for their configuration — context length alone does not
+> determine decode speed; task type (via speculative acceptance) and draft length also matter.
+
+### Per-request metrics: streaming vs non-streaming
+
+| Request mode | `metrics` block |
+|---|---|
+| `stream=False` | all six: `time_to_first_token_ms`, `generation_time_ms`, `queue_time_ms`, `mean_itl_ms`, `tokens_per_second`, `speculative_decoding` |
+| `stream=True` | **only `speculative_decoding`** — the timing fields are not emitted mid-stream |
+
+So: read acceptance from either mode, but read server-side TTFT/ITL only from a non-streaming call.
