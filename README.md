@@ -41,7 +41,7 @@ bash bench.sh                 # 复现下面的数字
 
 ```bash
 # 在跑服务的机器上（要能访问 nvidia-smi）
-python3 scripts/modelwatch.py --serve --bind 0.0.0.0 --port 8090
+bash scripts/dashboard.sh start          # 包装了 modelwatch.py --serve，默认 8090
 # 浏览器打开 http://<host>:8090
 ```
 

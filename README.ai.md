@@ -181,7 +181,7 @@ agrees in both level and mean (the residual gap is the 10 s window boundary offs
 ### Web dashboard
 
 ```bash
-python3 scripts/modelwatch.py --serve --bind 0.0.0.0 --port 8090   # run it where nvidia-smi lives
+bash scripts/dashboard.sh start|stop|status    # wraps modelwatch.py --serve, default port 8090
 ```
 
 Self-contained single page (inline CSS/JS, no CDN), live via SSE, reconnect on drop: seven tiles
