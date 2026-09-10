@@ -136,9 +136,15 @@ else
   fi
 fi
 
-# a stable symlink so upgrading vLLM is "repoint the link and restart"
-run ln -sfn "$VENV" "$HOME/vllm-current"
-ok "active interpreter symlink: $HOME/vllm-current -> $VENV"
+# A stable symlink so upgrading vLLM is "repoint the link and restart".
+# Never clobber an existing link: on a machine that has deliberately switched to
+# another venv, re-running this installer must not silently downgrade it.
+if [ -L "$HOME/vllm-current" ]; then
+  ok "keeping existing symlink: $HOME/vllm-current -> $(readlink "$HOME/vllm-current")"
+else
+  run ln -sfn "$VENV" "$HOME/vllm-current"
+  ok "active interpreter symlink: $HOME/vllm-current -> $VENV"
+fi
 
 if need uv; then
   run uv pip install --python "$VENV/bin/python" "vllm==$VLLM_VERSION"
@@ -194,7 +200,8 @@ else
     else
       run "$VENV/bin/python" -m pip install --no-deps "$TMP_WHEEL"
     fi
-    ok "prebuilt kernels installed (959 modules) — no JIT at startup"
+    MODS=$("$VENV/bin/python" -c 'import flashinfer_jit_cache as m,pathlib;print(len(list(pathlib.Path(m.get_jit_cache_dir()).iterdir())))' 2>/dev/null || echo "?")
+    ok "prebuilt kernels installed ($MODS modules) — no JIT at startup"
   fi
 fi
 
