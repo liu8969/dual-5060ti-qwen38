@@ -37,6 +37,14 @@ bash install.sh               # 装好并启动
 bash bench.sh                 # 复现下面的数字
 ```
 
+**盯着负载跑（Web 仪表盘）**
+
+```bash
+# 在跑服务的机器上（要能访问 nvidia-smi）
+python3 scripts/modelwatch.py --serve --bind 0.0.0.0 --port 8090
+# 浏览器打开 http://<host>:8090
+```
+
 **方式二：整个项目丢给 AI agent**
 
 不用自己读参数，把仓库（或压缩包）交给任意 AI coding agent（Claude Code / Cursor / DSH / Codex…），
@@ -77,6 +85,7 @@ bash bench.sh                 # 复现下面的数字
 | `install.sh` | 一键安装（幂等，支持 `DRY_RUN=1`） |
 | `bench.sh` | 基准测试 → `results/bench-<时间戳>.md` |
 | `modelctl watch --gpu` | 盯住正在跑的负载：每 2 秒一行 prefill/decode/queue/KV/cache/accept |
+| `modelwatch.py --serve` | **Web 仪表盘**：实时曲线 + 数字卡片 + GPU，浏览器打开即用 |
 | `scripts/modelctl` | 运维 CLI（status/start/stop/restart/logs/bench/**watch**/supervise） |
 | `scripts/modelwatch.py` | **实时监控**：prefill / decode / 队列 / KV / 缓存命中 / 投机接受度，兼容 vLLM·SGLang·llama.cpp |
 | `README.ai.md` | **给 AI 的详细手册**（参数原理、诊断树、失败签名、运维规程） |

@@ -178,6 +178,20 @@ Reading the output:
 Verified against the engine's own accounting: `prefill` and `running` match exactly, and `decode`
 agrees in both level and mean (the residual gap is the 10 s window boundary offset).
 
+### Web dashboard
+
+```bash
+python3 scripts/modelwatch.py --serve --bind 0.0.0.0 --port 8090   # run it where nvidia-smi lives
+```
+
+Self-contained single page (inline CSS/JS, no CDN), live via SSE, reconnect on drop: seven tiles
+(prefill / decode / queue / KV / cache / acceptance / preemptions), a 4-series chart with autoscaling,
+GPU utilisation-power-VRAM bars, and a rolling table of the last 300 samples.
+
+Run it **on the host that has the GPUs** — a laptop-side instance still reads `/metrics` across the
+network but shows no GPU row, because `nvidia-smi` is local-only. Stop it with
+`pkill -f 'modelwatch.py --serve'`.
+
 ## 6. Prebuilt kernels (removes the 5–10 minute compile)
 
 ```bash
