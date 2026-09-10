@@ -39,7 +39,7 @@ Compilers present → FlashInfer JIT, wait it out (permanent fix in `README.ai.m
 
 ## Reference numbers (warm)
 
-Single stream 115.7 tok/s (thinking off) / 79.1 (on) · C=4 aggregate 255.5 tok/s · KV pool 170,280 (prefix caching on) ·
+Single stream 122.5 tok/s (thinking off) / 83.6 (on) · C=4 aggregate 274.1 tok/s · KV pool 170,280 (prefix caching on) ·
 VRAM ~15,600 MiB/card · recovery after `kill -9` 90 s. More than ~5% below → investigate.
 
 Details, parameter rationale, diagnostic tree and failure signatures: [`README.ai.md`](README.ai.md).

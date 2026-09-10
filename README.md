@@ -18,8 +18,8 @@ Serving a 27B model at 150K context on two 16 GB consumer Blackwell cards.
 
 ```
 CUDA 13.3 · driver 610.57.04 · Ubuntu 24.04 · kernel 7.0.0-31
-Python 3.13.5 · torch 2.13.0+cu130 · vLLM 0.28.0
-flashinfer 0.6.16.post3 + flashinfer-jit-cache（预编译内核，启动不编译）
+Python 3.13.5 · torch 2.13.0+cu130 · **vLLM 0.29.0**
+flashinfer 0.6.18 + flashinfer-jit-cache 0.6.18+cu130（预编译内核，启动不编译）
 ```
 
 ## 主机
@@ -97,7 +97,7 @@ Serve a 27B model at 150K context on 2× 16 GB consumer Blackwell — **170,280-
 | **Throughput** | 115.7 tok/s single stream · 255.5 tok/s aggregate at C=4 |
 
 **Environment**: CUDA 13.3 · driver 610.57.04 · Ubuntu 24.04 · Python 3.13.5 · torch 2.13.0+cu130 ·
-vLLM 0.28.0 · flashinfer 0.6.16.post3 (+ prebuilt kernel wheel, no JIT at startup).
+vLLM 0.29.0 · flashinfer 0.6.18 (+ prebuilt kernel wheel, no JIT at startup).
 
 **Host**: 2× RTX 5060 Ti 16 GB (sm_120a) · 31 GB RAM.
 

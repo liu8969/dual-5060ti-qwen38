@@ -19,9 +19,9 @@
 | CUDA toolkit | 13.3 (V13.3.73) | `nvcc --version` |
 | Python | 3.13.5 (in `~/vllm-venv`) | `~/vllm-venv/bin/python -V` |
 | torch | 2.13.0+cu130 | `~/vllm-venv/bin/python -c 'import torch;print(torch.__version__)'` |
-| vLLM | 0.28.0 | `~/vllm-venv/bin/python -c 'import vllm;print(vllm.__version__)'` |
-| flashinfer | 0.6.16.post3 | `~/vllm-venv/bin/python -c 'import flashinfer;print(flashinfer.__version__)'` |
-| Prebuilt kernels | `flashinfer-jit-cache==0.6.16.post3+cu130`, 959 modules | `~/vllm-venv/bin/python -c 'import flashinfer_jit_cache as m;print(m.get_jit_cache_dir())'` |
+| vLLM | 0.29.0 | `~/vllm-venv/bin/python -c 'import vllm;print(vllm.__version__)'` |
+| flashinfer | 0.6.18 | `~/vllm-venv/bin/python -c 'import flashinfer;print(flashinfer.__version__)'` |
+| Prebuilt kernels | `flashinfer-jit-cache==0.6.18+cu130`, 906 modules | `~/vllm-venv/bin/python -c 'import flashinfer_jit_cache as m;print(m.get_jit_cache_dir())'` |
 | KV pool | 170,280 tokens with prefix caching on (172,480 with it off) | `modelctl status` |
 | VRAM in use | ~15,600 MiB / card of 16,311 | `nvidia-smi` |
 | Install dir | `~/deploy-5060ti` | |
