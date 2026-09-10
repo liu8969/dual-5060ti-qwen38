@@ -36,7 +36,8 @@ Status: draft — not submitted yet.
 ### Runtime & Model
 
 - Runtime/engine: `vLLM`
-- Runtime version or commit: `0.28.0`
+- Runtime version or commit: `0.28.0` (these receipts were measured on 0.28.0; production has since
+  moved to 0.29.0, which measured **+5.9%** decode on the same config)
 - Build flags: `stock uv wheel, no custom build`
 - Model id: `Merkyor/Qwen3.8-27B-EfficientThink-K3-Opus5-Grok4.6-GPT5.6Sol-SFT-SimPO-DFlash2` (subdir `NVFP4/W4A4`)
 - Family/variant: `Qwen3.8 27B hybrid (48 GDN + 16 full-attention layers, native 262,144 ctx)`

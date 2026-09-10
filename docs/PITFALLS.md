@@ -67,7 +67,7 @@
 | 栈 | KV 精度 | 每 token 成本 | 结果 |
 |---|---|---|---|
 | SGLang | fp8_e4m3 | ~20.2 KB/token/卡 | 池 106,357（mfs 0.92） |
-| **vLLM** | **fp8** | **16 KB/token** | **池 172,480** |
+| **vLLM** | **fp8** | **16 KB/token** | **池 170,280**（关前缀缓存 172,480） |
 
 **vLLM 的 KV 更便宜，同样显存能开更大池子** —— 这是选 vLLM 做 150K 长文档的核心原因。
 
@@ -85,7 +85,7 @@
 ### 3.1 生产参数
 
 ```
-vLLM 0.28.0 + Merkyor W4A4 + DFlash2 + FP8 KV
+vLLM 0.29.0 + Merkyor W4A4 + DFlash2 + FP8 KV
 --kv-cache-memory 3865470566      # 硬钉 3.6 GiB → 池 170,280（关前缀缓存 172,480）
 --enable-prefix-caching           # 重复长提示 TTFT 90K 档 49.5s → 1.2s
 --max-num-batched-tokens 1024     # 不能调大
@@ -192,7 +192,7 @@ https://gh-proxy.com/https://github.com/flashinfer-ai/flashinfer/releases/downlo
 ~/.local/bin/uv pip install --python ~/vllm-venv/bin/python <wheel>
 ```
 
-- 已装 `flashinfer-jit-cache==0.6.16.post3+cu130`：**959 个预编译模块**，含 `fp4_gemm_cutlass_sm120`、`gemm_sm120`、`nvfp4_attention_sm120`、388 个 xqa 变体等。
+- 当前装 `flashinfer-jit-cache==0.6.18+cu130`：**906 个预编译模块**，含 `fp4_gemm_cutlass_sm120`、`gemm_sm120`、`nvfp4_attention_sm120` 等（0.29 之前是 0.6.16.post3 / 959 模块）。
 - `cuobjdump --list-elf` 核对：预编译版与本地编译版 **cubin 都是 `sm_120`**，体积 5,336,880 vs 5,316,288 字节 —— 内核等价，不掉性能。
 - 效果：重启 180 秒 → **66 秒**，全程零编译。
 - **升级 flashinfer / vLLM 后必须同步换对应版本的轮子**，否则回落到现场编译。
@@ -203,7 +203,7 @@ https://gh-proxy.com/https://github.com/flashinfer-ai/flashinfer/releases/downlo
 
 | 栈 | 上下文 | KV 池 | 单流（关/开思考） | 并发聚合 | 100K 召回 |
 |---|---|---|---|---|---|
-| **vLLM + W4A4 + DFlash2**（生产） | 150K | **172,480** | **115.7 / 79.1** | C=4 **255.5** | 5/5 |
+| **vLLM + W4A4 + DFlash2**（生产） | 150K | **170,280** | **122.5 / 83.6** | C=4 **274.1** | 5/5 |
 | SGLang + W4A4 + DFlash | 106K | 106,357 | 100.5 / 72.9 | — | 5/5 |
 | llama.cpp + GSQ IQ3_S + DFlash2 | 256K | — | 66.4 / 47.0 | — | 5/5 |
 | vLLM + FP8 KV + MTP3 | 150K | 247,150 | 73.2 / 58.3 | — | 5/5 |
@@ -228,7 +228,7 @@ https://gh-proxy.com/https://github.com/flashinfer-ai/flashinfer/releases/downlo
 | darksidewalker | 单卡 5090 + DFlash2 + fp8 | 池 90.7–94.9K |
 | 0xSero / qwen38-3090-sglang | 2×3090 + AWQ-INT4 + DSpark | 118,693（bf16） |
 | club-5060ti | vLLM | 122,880 |
-| 我们（本次） | 2×5060Ti + W4A4 + DFlash2 + FP8 KV | **172,480** |
+| 我们（本次） | 2×5060Ti + W4A4 + DFlash2 + FP8 KV | **170,280** |
 
 **我们超过了所有已知社区配置的 KV 池**，关键是 `--kv-cache-memory` 硬钉 + FP8 KV + W4A4 省显存。
 

@@ -32,12 +32,12 @@ MODEL_SUBDIR="${MODEL_SUBDIR:-NVFP4/W4A4}"
 MODEL_DIR="$MODEL_ROOT/$MODEL_SUBDIR"
 DRAFT_DIR="$MODEL_DIR/DFlash2-FP8"
 
-VLLM_VERSION="${VLLM_VERSION:-0.28.0}"
+VLLM_VERSION="${VLLM_VERSION:-0.29.0}"
 CUDA_TAG="${CUDA_TAG:-cu130}"                 # wheel tag for flashinfer-jit-cache
 FLASHINFER_VER="${FLASHINFER_VER:-}"          # empty = detect from installed flashinfer
 PORT="${PORT:-8080}"
 SERVED_NAME="${SERVED_NAME:-Qwen3.8-27B-Q6-dual-5060ti}"
-KV_BYTES="${KV_BYTES:-3865470566}"            # pinned KV pool -> 172,480 tokens
+KV_BYTES="${KV_BYTES:-3865470566}"            # pinned KV pool -> 170,280 tokens
 MAX_LEN="${MAX_LEN:-150000}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-4}"
 MAX_BATCHED_TOKENS="${MAX_BATCHED_TOKENS:-1024}"
@@ -136,6 +136,10 @@ else
   fi
 fi
 
+# a stable symlink so upgrading vLLM is "repoint the link and restart"
+run ln -sfn "$VENV" "$HOME/vllm-current"
+ok "active interpreter symlink: $HOME/vllm-current -> $VENV"
+
 if need uv; then
   run uv pip install --python "$VENV/bin/python" "vllm==$VLLM_VERSION"
   run uv pip install --python "$VENV/bin/python" "huggingface_hub[hf_transfer]"
@@ -153,7 +157,7 @@ if [ -z "$FI_VER" ] && [ -x "$VENV/bin/python" ] && [ "$DRY_RUN" = "0" ]; then
 fi
 if [ -z "$FI_VER" ]; then
   if [ "$DRY_RUN" = "1" ]; then
-    FI_VER="0.6.16.post3"
+    FI_VER="0.6.18"
     info "[dry-run] flashinfer not installed yet; assuming $FI_VER (override with FLASHINFER_VER=...)"
   else
     die "cannot detect flashinfer version — set FLASHINFER_VER=x.y.z"

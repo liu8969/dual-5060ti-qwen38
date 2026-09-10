@@ -21,7 +21,15 @@ MODELS="${MODELS:-$HOME/Models}"
 MODEL="${MODEL:-$MODELS/Merkyor-W4A4/NVFP4/W4A4}"
 DRAFT="${DRAFT:-$MODEL/DFlash2-FP8}"
 SERVED_MODEL="${SERVED_MODEL:-Qwen3.8-27B-Q6-dual-5060ti}"
-VLLM_BIN="${VLLM_BIN:-$HOME/vllm-venv/bin/vllm}"
+# Prefer the switchable symlink (install.sh creates it) so upgrading vLLM is a
+# one-command symlink swap instead of editing this script.
+if [ -z "${VLLM_BIN:-}" ]; then
+  if [ -x "$HOME/vllm-current/bin/vllm" ]; then
+    VLLM_BIN="$HOME/vllm-current/bin/vllm"
+  else
+    VLLM_BIN="$HOME/vllm-venv/bin/vllm"
+  fi
+fi
 K="${K:-5}"
 MAXLEN="${MAXLEN:-150000}"
 MAXNUM="${MAXNUM:-1024}"
@@ -49,7 +57,7 @@ exec "$VLLM_BIN" serve "$MODEL" \
   --enable-chunked-prefill \
   --speculative-config "$SPEC" \
   --no-enable-flashinfer-autotune \
-  --no-enable-prefix-caching \
+  --enable-prefix-caching \
   --disable-custom-all-reduce \
   --language-model-only \
   --enable-auto-tool-choice \

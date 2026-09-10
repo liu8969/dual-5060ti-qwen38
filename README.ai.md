@@ -34,7 +34,7 @@ assume the table is right.
 ## 2. The serving profile, and why each value is what it is
 
 ```
-vLLM 0.28.0
+vLLM 0.29.0
   --model            Merkyor W4A4 (NVFP4 compressed-tensors, 18.8 GB)
   --speculative-config  dflash draft (DFlash2-FP8), num_speculative_tokens=5, TP=2
   --kv-cache-dtype   fp8
@@ -143,7 +143,7 @@ grep -oE 'CUDA out of memory[^)]*|ValueError[^\n]{0,160}|RuntimeError[^\n]{0,160
 ## 6. Prebuilt kernels (removes the 5–10 minute compile)
 
 ```bash
-~/vllm-venv/bin/python -c 'import flashinfer;print(flashinfer.__version__)'   # e.g. 0.6.16.post3
+~/vllm-venv/bin/python -c 'import flashinfer;print(flashinfer.__version__)'   # e.g. 0.6.18
 # wheel: flashinfer_jit_cache-<VER>+<cuda-tag>-cp39-abi3-manylinux_2_28_x86_64.whl
 # index:  https://flashinfer.ai/whl/<cuda-tag>/flashinfer-jit-cache/   (links → GitHub releases)
 # mirror: https://gh-proxy.com/https://github.com/flashinfer-ai/flashinfer/releases/download/v<VER>/<wheel>

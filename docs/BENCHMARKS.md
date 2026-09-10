@@ -12,8 +12,8 @@ different prompts, token limits, or cold/warm states.
 | GPU | 2× RTX 5060 Ti 16 GB (GB206, sm_120a), no NVLink |
 | CPU / RAM | i5-13600KF / 32 GB DDR5 |
 | OS | Ubuntu 24.04, kernel 7.0.0-31, driver 610.57.04 |
-| Stack | vLLM 0.28.0 + Merkyor W4A4 (NVFP4) + DFlash2-FP8 + FP8 KV |
-| Kernels | `flashinfer-jit-cache==0.6.16.post3+cu130` (prebuilt, no JIT) |
+| Stack | vLLM **0.29.0** + Merkyor W4A4 (NVFP4) + DFlash2-FP8 + FP8 KV (0.28.0 for the §4/§9 runs) |
+| Kernels | `flashinfer-jit-cache==0.6.18+cu130` (prebuilt, no JIT; 0.6.16.post3 before the 0.29 upgrade) |
 
 ## 1. Production config / 生产配置
 
@@ -60,7 +60,7 @@ different prompts, token limits, or cold/warm states.
 
 | Stack | Context | KV pool | Single stream (off/on) | 100K recall |
 |---|---|---|---|---|
-| **vLLM + W4A4 + DFlash2** (production) | 150K | **172,480** | **115.7 / 79.1** | 5/5 |
+| **vLLM + W4A4 + DFlash2** (production¹) | 150K | **170,280** | **122.5 / 83.6** | 5/5 |
 | SGLang + W4A4 + DFlash (mfs 0.92) | 106K | 106,357 | 100.5 / 72.9 | 5/5 |
 | vLLM + FP8 KV + MTP3 | 150K | 247,150 | 73.2 / 58.3 | 5/5 |
 | llama.cpp + GSQ-RCO IQ3_S + DFlash2 | 256K | — | 66.4 / 47.0 | 5/5 |
@@ -72,6 +72,10 @@ Notes:
 - vLLM's MTP3 pool is larger (247,150) but decode is much slower than DFlash2 — DFlash2 wins for
   interactive use.
 - llama.cpp is the only option for 256K (GGUF), but throughput is ~40% lower.
+
+¹ Current production values (vLLM 0.29.0, prefix caching on). The §4 stack comparison and §9 protocol
+receipts were measured on vLLM 0.28.0 with prefix caching off, at a **172,480** pool and
+**115.7 / 79.1** tok/s. Both are correct for their configuration — do not mix them.
 
 ## 5. KV cost per token / 每 token 的 KV 成本
 
@@ -89,7 +93,7 @@ This 20% difference is the main reason vLLM was chosen for long-context producti
 | darksidewalker | single 5090 + DFlash2 + fp8 | 90.7–94.9K |
 | 0xSero | 2×3090 + AWQ-INT4 + DSpark | 118,693 |
 | club-5060ti | vLLM | 122,880 |
-| **this project** | **2×5060Ti + W4A4 + DFlash2 + FP8 KV** | **172,480** |
+| **this project** | **2×5060Ti + W4A4 + DFlash2 + FP8 KV** | **170,280** |
 
 ## 7. Reproduction / 复现
 

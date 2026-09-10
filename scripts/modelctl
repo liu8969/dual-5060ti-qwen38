@@ -45,7 +45,7 @@ kill_all() {
 profile_cmd() {
   case "$1" in
     vllm-dflash)
-      echo "KVBYTES=${KVBYTES:-3865470566} MAXNUM=${MAXNUM:-1024} UTIL=${UTIL:-0.977} SEQ=${SEQ:-4} setsid nohup bash $D/vllm-merkyor-dflash-launch.sh"
+      echo "VLLM_BIN=${VLLM_BIN:-$HOME/vllm-current/bin/vllm} KVBYTES=${KVBYTES:-3865470566} MAXNUM=${MAXNUM:-1024} UTIL=${UTIL:-0.977} SEQ=${SEQ:-4} setsid nohup bash $D/vllm-merkyor-dflash-launch.sh"
       ;;
     vllm-mtp)
       echo "MAX_JOBS=${MAX_JOBS:-2} MODEL=$MODELS/Merkyor-W4A4/NVFP4/W4A4 MTP_N=3 MAXLEN=${MAXLEN:-150000} setsid nohup bash $D/vllm-merkyor-launch.sh"
