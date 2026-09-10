@@ -38,6 +38,20 @@ ATTN="${ATTN:-TRITON_ATTN}"
 EXTRA_ARGS=()
 if [ -n "${KVBYTES:-}" ]; then EXTRA_ARGS+=(--kv-cache-memory "$KVBYTES"); fi
 
+# --- vLLM 0.29 new knobs (all optional, env-driven) ---------------------------
+# observability / diagnostics
+[ -n "${SPEC_METRICS:-}" ] && EXTRA_ARGS+=(--per-request-spec-decode-metrics "$SPEC_METRICS")
+[ -n "${SCHED_TOKENS:-}" ] && EXTRA_ARGS+=(--max-num-scheduled-tokens "$SCHED_TOKENS")
+[ "${KV_METRICS:-0}" = "1" ] && EXTRA_ARGS+=(--kv-cache-metrics)
+[ "${MFU_METRICS:-0}" = "1" ] && EXTRA_ARGS+=(--enable-mfu-metrics)
+[ "${CG_METRICS:-0}" = "1" ] && EXTRA_ARGS+=(--cudagraph-metrics)
+[ -n "${QUEUED_REQS:-}" ] && EXTRA_ARGS+=(--max-num-queued-reqs "$QUEUED_REQS")
+# hybrid (GDN) prefix caching / kernels
+[ -n "${MAMBA_MODE:-}" ] && EXTRA_ARGS+=(--mamba-cache-mode "$MAMBA_MODE")
+[ -n "${PCRI:-}" ] && EXTRA_ARGS+=(--prefix-cache-retention-interval "$PCRI")
+[ -n "${GDN_BACKEND:-}" ] && EXTRA_ARGS+=(--gdn-prefill-backend "$GDN_BACKEND")
+# -----------------------------------------------------------------------------
+
 SPEC=$(printf '{"model":"%s","method":"dflash","num_speculative_tokens":%s,"quantization":"compressed-tensors","draft_tensor_parallel_size":2}' "$DRAFT" "$K")
 
 exec "$VLLM_BIN" serve "$MODEL" \

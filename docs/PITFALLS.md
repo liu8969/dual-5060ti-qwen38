@@ -292,3 +292,51 @@ ln -sfn ~/vllm-venv ~/vllm-current && sudo systemctl restart modelctl
 6. **0.29 新行为**：首次推理会 JIT 编译 Triton 内核 `_prepare_dflash_inputs_kernel`（一次性，
    第一个请求慢 10%）；启动日志会出现 `Add 4 padding layers, may waste at most 25.00% KV cache memory`
    和 `max_num_scheduled_tokens is set to 1024 based on the speculative decoding settings` 警告——都是正常的。
+
+---
+
+## 12. vLLM 0.29 新参数实测（2026-09-10）
+
+### 结论速查
+
+| 参数 | 结果 |
+|---|---|
+| `--per-request-spec-decode-metrics summary` | **装上**。每个响应的 `metrics.speculative_decoding` 给出接受率/平均接受长度/直方图；还顺带给出 TTFT、ITL、queue time |
+| `K=10`（草稿长度） | **装上**。单流 121.6 → **162 tok/s（+33%）**；K=12 是断崖（接受率 86%→53%），别超 |
+| `--max-num-scheduled-tokens 8192` | **装上**。`max_num_scheduled_tokens < 8192` 警告消失，不影响 KV 池 |
+| `--kv-cache-metrics` / `--enable-mfu-metrics` / `--cudagraph-metrics` | **装上**。单流速度与基线一致（122.4 vs 122.5），观测开销≈0 |
+| `--max-num-queued-reqs 32` | **装上**。准入阀门，超限返回 503 而不是无限排队 |
+| `--mamba-cache-mode all` | 能用、KV 池不变，但 vLLM 对混合模型已自动选 `align`，**收益未证实 → 保持默认** |
+| `--prefix-cache-retention-interval` | 能启动（必须是 scheduler_block_size 的倍数），**收益未证实 → 不启用** |
+| `--gdn-prefill-backend cutedsl` | **无效**，sm_120 不在白名单，永远回退 Triton |
+
+### 五个坑
+
+1. **`scheduler_block_size` 会随 K 变**：K=5 时是 848，K=10 时是 **912**。`--prefix-cache-retention-interval`
+   必须是它的倍数，否则直接 `ValueError` 且**引擎起不来**（服务整个挂掉）。
+2. **测试脚本里的 `pgrep -f 'vllm serve'` 会被 modelctl 自己的 `pkill -9 -f 'vllm serve'` 杀掉**
+   （pgrep 进程的命令行含这个字符串）。表现是脚本误判"进程死了"→ 报告失败并回滚，**把一个能用的参数
+   判成不能用**。我因此误判了 PCRI、cutedsl、mamba `all` 三个参数。改用 `[v]llm serve` 或只看 health。
+3. **`vllm serve --help` 在 0.29 不再列出参数**，默认只显示 Config Groups；要 `--help=all`（2008 行）
+   才能 grep 具体参数。
+4. **平台白名单要在源码里确认，不要只看日志**：`is_device_capability_family(100)` 只覆盖 SM100 家族，
+   不含 SM120；`SYMM_MEM_ALL_REDUCE_MAX_SIZES` 的键是 `['9.0','10.0','10.3','10.7']`——用
+   `python -c "from vllm... import ...; print(cap in dict)"` 直接验证，别猜。
+5. **改一个参数就重启一次**：0.29 新增的参数如果组合起来出错，很难定位。用带自动回滚的 harness
+   （`try_knob` 思路：备份 env → 应用 → 重启 → 只认 health → 失败自动恢复）。
+
+### 新增的观察（0.29 启动日志）
+
+```
+SymmMemCommunicator: Device capability 12.0 not supported, communicator is not available.
+FlashInfer All Reduce is disabled because it is not supported for world_size=2.
+Add 2 padding layers, may waste at most 4.17% KV cache memory
+Add 4 padding layers, may waste at most 25.00% KV cache memory
+Padding mamba page size by 1.56% ...
+Mamba cache mode is set to 'align' for Qwen3_5ForConditionalGeneration by default when prefix caching is enabled
+Using uncalibrated q_scale 1.0 and/or prob_scale 1.0 with fp8 attention. This may cause accuracy issues.
+Triton kernel JIT compilation during inference: _prepare_dflash_inputs_kernel / _compute_local_logits_stats_kernel / _rejection_kernel / _resample_kernel
+```
+
+最后一条是 0.29 的 `jit_monitor` 新功能：投机解码的 4 个 Triton 内核在**首次推理时**才编译（一次性
+延迟尖峰）。可用 `--jit-monitor-mode error` 让它变成硬失败，或 `--jit-monitor-verbose` 看详情。

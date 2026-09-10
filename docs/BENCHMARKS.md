@@ -172,3 +172,77 @@ sent twice in a row (no nonce, so the second request can reuse the prefix).
 - The gain scales with context length — exactly the long-document / repeated-system-prompt case.
 - All protocol receipts in §9 were taken **with prefix caching disabled** (pool 172,480). Re-running
   the 131K tier with caching on would only change the first (cold) request of each shape.
+
+## 11. DFlash2 draft length sweep / 草稿长度扫描（vLLM 0.29）
+
+`--speculative-config.num_speculative_tokens` (env `K` in `~/.modelctl.env`). Everything else fixed:
+prefix caching on, `--max-num-batched-tokens 1024`, FP8 KV, pinned `--kv-cache-memory`.
+
+| K | Decode off (tok/s) | Decode on | Mean accept length | Draft acceptance | KV pool |
+|---|---|---|---|---|---|
+| 5 | 121.6 | 83.6 | 5.70 | 94.1% | 170,280 |
+| 7 | 144.5 | 85.4 | 7.33 | 90.5% | 164,807 |
+| **10** | **162 – 176** | **87 – 90** | **9.63** | **86.3%** | **157,824** |
+| 12 | 148.0 | 81.8 | 7.41 | **53.4%** | 153,589 |
+
+**K=10 is the optimum, and K=12 is a cliff, not a slope.** Acceptance collapses 86% → 53% because the
+DFlash2 draft model is trained to about ten tokens ahead; past that its predictions stop being useful
+while every step still pays for drafting them. Per-request histograms show the shape clearly:
+
+- K=10: `[0,0,1,1,0,0,1,1,0,0,12]` — **12 of 16 steps accepted all ten drafts**
+- K=12: `[2,1,4,2,2,1,2,0,3,2,1,3,4]` — acceptance smeared across all positions, no mode
+
+Cost of the win: the KV pool shrinks ~2,490 tokens per extra draft slot (170,280 → 157,824, −7.3%).
+157,824 is still 1.05× a 150K request, so the 150K guarantee survives. K=14 would drop below 150K.
+
+Measured with `--per-request-spec-decode-metrics summary`, which returns in every response body:
+
+```json
+"metrics": {
+  "time_to_first_token_ms": ..., "generation_time_ms": ..., "queue_time_ms": ...,
+  "mean_itl_ms": ..., "tokens_per_second": ...,
+  "speculative_decoding": {
+    "mean_acceptance_length": 9.63, "draft_acceptance_rate": 0.863,
+    "acceptance_histogram": [0,0,1,1,0,0,1,1,0,0,12],
+    "num_spec_steps": 16, "num_accepted_draft_tokens": 138, "num_draft_tokens": 160
+  }
+}
+```
+
+Aggregate (no flag needed) is on `/metrics`: `vllm:spec_decode_num_drafts_total`,
+`..._draft_tokens_total`, `..._accepted_tokens_total`, and
+`..._accepted_tokens_per_pos_total` (per draft position — this is what located the K=12 cliff).
+
+## 12. Concurrency / 并发（vLLM 0.29, K=10）
+
+| C | Aggregate tok/s | Per-stream tok/s | Notes |
+|---|---|---|---|
+| 1 | 74.6 | 74.7 | |
+| 2 | 142.7 | 71.3 / 76.9 | 1.9× |
+| **4** | **249.9** | 62.5 / 66.7 / 67.4 / 69.0 | **sweet spot, no queueing** |
+| 6 | 193.8 | 2 streams drop to ~32 | queueing; aggregate *falls* |
+| 8 | 243.1 | 4 streams drop to ~30 | queueing |
+
+`--max-num-seqs 4` is confirmed optimal. Beyond 4, the extra requests do not run — they queue, and the
+interference makes aggregate throughput **lower** than C=4. The binding constraint is the KV pool,
+not the slot count: 4 streams already hold a large fraction of 157,824 tokens.
+
+## 13. Platform limitations on sm_120 (source-verified) / 消费级 Blackwell 的引擎限制
+
+Three 0.29 warnings are **engine platform gates, not misconfiguration**. Each was verified by reading
+vLLM's own source (and, for the third, by importing vLLM's own constant):
+
+| Message | Gate in the source | Verdict |
+|---|---|---|
+| `GDN prefill backend 'cutedsl' … Falling back to Triton/FLA` | `_resolve_gdn_prefill_backend()`: FlashInfer/CuteDSL require `is_device_capability(90)` or `is_device_capability_family(100)`. We are **12.0**. | Triton is the only GDN prefill backend for SM120. `auto` also resolves to Triton — nothing to tune. |
+| `SymmMemCommunicator: Device capability 12.0 not supported` | `SYMM_MEM_ALL_REDUCE_MAX_SIZES` keys are `['9.0','10.0','10.3','10.7']`; `"12.0" in dict` → `False` | Symmetric-memory all-reduce is Hopper/datacenter-Blackwell only. |
+| `FlashInfer All Reduce is disabled because it is not supported for world_size=2` | 0.29 enabled it by default for TP CUDA groups, but only for supported world sizes | Not available at TP=2 on this platform. |
+
+Also seen and benign: `Add 2/4 padding layers, may waste at most 4.17% / 25.00% KV cache memory`,
+`Padding mamba page size by 1.56%`, and `Using uncalibrated q_scale 1.0 … with fp8 attention`
+(the last one is a genuine accuracy caveat — our 100K retrieval is still 5/5).
+
+`--mamba-cache-mode all` starts fine and leaves the KV pool unchanged (157,824), but vLLM already
+selects `align` automatically for this hybrid model when prefix caching is on
+(`Mamba cache mode is set to 'align' for Qwen3_5ForConditionalGeneration by default when prefix
+caching is enabled`). No measured benefit from overriding it, so the default is kept.

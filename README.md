@@ -10,9 +10,9 @@ Serving a 27B model at 150K context on two 16 GB consumer Blackwell cards.
 | **模型** | [Merkyor / Qwen3.8-27B-EfficientThink-…-DFlash2](https://huggingface.co/Merkyor/Qwen3.8-27B-EfficientThink-K3-Opus5-Grok4.6-GPT5.6Sol-SFT-SimPO-DFlash2) |
 | **量化** | NVFP4 W4A4（compressed-tensors，18.8 GB，9.3 GB/卡） |
 | **解码** | DFlash2 投机解码，草稿 `DFlash2-FP8`（2.4 GB），5 tokens/步，接受长度 3.46–4.77 |
-| **KV** | FP8，16 KB/token → 池 170,280 token（开前缀缓存） |
-| **上下文 / 并发** | 150,000 / 4 条流共享同一 KV 池 |
-| **吞吐** | 115.7 tok/s 单流 · 255.5 tok/s 聚合（C=4） |
+| **KV** | FP8，16 KB/token → 池 157,824 token（K=10 + 前缀缓存） |
+| **上下文 / 并发** | 150,000 / 4 条流共享同一 KV 池（K=10 下池子 157,824，仍是 150K 的 1.05×） |
+| **吞吐** | **162 tok/s** 单流 · **249.9** tok/s 聚合（C=4） |
 
 ## 环境
 
@@ -55,13 +55,14 @@ bash bench.sh                 # 复现下面的数字
 
 | 指标 | 数值 |
 |---|---|
-| KV 池 | 170,280 token（开前缀缓存；关闭时 172,480） |
+| KV 池 | **157,824** token（K=10 + 前缀缓存；K=5 时 170,280） |
 | 显存 | 15,597 MiB / 卡（共 16,311） |
-| 解码（短提示 49 token） | 115.7 tok/s（关思考）/ 79.1（开思考） |
+| 解码（短提示 49 token） | **162** tok/s（关思考）/ **87**（开思考）— DFlash2 K=10 |
 | 解码（长上下文 92K） | **33.5 tok/s** ⚠️ 见下 |
 | 预填充 | 1,466 tok/s @92K · 1,257 tok/s @115K |
 | TTFT @92K / @115K | 62.6 s / 91.8 s |
-| 并发聚合（短提示） | C=1 70.4 · C=2 149.4 · **C=4 255.5** · C=8 264.7 tok/s |
+| 并发聚合（短提示） | C=1 74.6 · C=2 142.7 · **C=4 249.9** · C=6 193.8（排队）· C=8 243.1 |
+| DFlash2 接受度 | 代码类任务 **94%**、平均接受长度 **9.63** token/步（`--per-request-spec-decode-metrics summary`） |
 | 长文召回 | 5/5 @96.6K；club 协议 2/2 @115K |
 | 前缀缓存 | 重复长提示 TTFT：30K 档 11.9s→0.7s（16.9×）· 90K 档 49.5s→1.2s（**40.2×**） |
 | 启动 / 崩溃恢复 | 66–200 s / 90 s |
@@ -91,13 +92,13 @@ Serve a 27B model at 150K context on 2× 16 GB consumer Blackwell — **170,280-
 |---|---|
 | **Model** | [Merkyor / Qwen3.8-27B-EfficientThink-…-DFlash2](https://huggingface.co/Merkyor/Qwen3.8-27B-EfficientThink-K3-Opus5-Grok4.6-GPT5.6Sol-SFT-SimPO-DFlash2) |
 | **Quantization** | NVFP4 W4A4 (compressed-tensors), 18.8 GB |
-| **Decode** | DFlash2 speculative decoding, `DFlash2-FP8` draft, 5 tokens/step, accept length 3.46–4.77 |
+| **Decode** | DFlash2 speculative decoding, `DFlash2-FP8` draft, **10 tokens/step**, measured accept rate 86–94% |
 | **KV** | FP8, 16 KB/token → 170,280-token pool |
 | **Context / concurrency** | 150,000 / 4 streams sharing one pool |
 | **Throughput** | 115.7 tok/s single stream · 255.5 tok/s aggregate at C=4 |
 
 **Environment**: CUDA 13.3 · driver 610.57.04 · Ubuntu 24.04 · Python 3.13.5 · torch 2.13.0+cu130 ·
-vLLM 0.29.0 · flashinfer 0.6.18 (+ prebuilt kernel wheel, no JIT at startup).
+vLLM 0.29.0 · flashinfer 0.6.18 (+ prebuilt kernel wheel, no JIT at startup) · DFlash2 K=10.
 
 **Host**: 2× RTX 5060 Ti 16 GB (sm_120a) · 31 GB RAM.
 

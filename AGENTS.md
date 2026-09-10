@@ -12,7 +12,8 @@ only the part an agent must never get wrong.
 3. **Never leave the endpoint down** at the end of a turn.
 4. **Never change `CUDA_HOME`** — the FlashInfer JIT cache key includes the nvcc path; changing it
    costs a 5–10 minute recompile.
-5. **Keep `--kv-cache-memory` pinned and `--max-num-batched-tokens 1024`.**
+5. **Keep `--kv-cache-memory` pinned and `--max-num-batched-tokens 1024`.** DFlash2 draft length lives in
+   `~/.modelctl.env` as `K` — **10 is the measured optimum, 12 is a cliff** (acceptance 86% → 53%).
 6. **`pgrep -f` / `pkill -f` must not match your own shell** — use `[c]icc` style patterns or a
    script file.
 7. **Upgrading flashinfer/vLLM requires the matching `flashinfer-jit-cache` wheel.**
@@ -39,7 +40,7 @@ Compilers present → FlashInfer JIT, wait it out (permanent fix in `README.ai.m
 
 ## Reference numbers (warm)
 
-Single stream 122.5 tok/s (thinking off) / 83.6 (on) · C=4 aggregate 274.1 tok/s · KV pool 170,280 (prefix caching on) ·
+Single stream 162 tok/s (thinking off) / 87 (on) · C=4 aggregate 249.9 tok/s · KV pool 157,824 (K=10 + prefix caching) ·
 VRAM ~15,600 MiB/card · recovery after `kill -9` 90 s. More than ~5% below → investigate.
 
 Details, parameter rationale, diagnostic tree and failure signatures: [`README.ai.md`](README.ai.md).

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# modelctl - one entry point for the local model services on this host.
+# modelctl - one entry point for the local model services on lcy-pc.
 #
 #   modelctl status            what is running, is it healthy, KV pool, VRAM
 #   modelctl start <profile>   start a profile (waits, detects early death)
@@ -10,7 +10,7 @@
 #   modelctl supervise <profile>   keep it alive (restart on crash)
 #
 # Profiles:
-#   vllm-dflash    vLLM + Merkyor W4A4 + DFlash2 + FP8 KV   (150K, ~116 tok/s)
+#   vllm-dflash    vLLM + Merkyor W4A4 + DFlash2 + FP8 KV   (150K, ~125 tok/s)
 #   vllm-mtp       vLLM + Merkyor W4A4 + MTP3 + FP8 KV      (150K, ~73 tok/s)
 #   sglang         SGLang + Merkyor W4A4 + DFlash2          (106K, ~100 tok/s)
 #   llama168       llama.cpp Q6_K + MTP2                    (168K, ~56 tok/s)
@@ -18,13 +18,16 @@
 set -uo pipefail
 
 D="${DEPLOY_DIR:-$HOME/deploy-5060ti}"
-MODELS="${MODELS:-$HOME/Models}"
-STATE="${MODELCTL_STATE:-$HOME/.modelctl.state}"          # current profile name
-PIDFILE="${MODELCTL_PIDFILE:-$HOME/.modelctl.supervisor}" # supervisor pid, if any
-PORT="${PORT:-8080}"
+STATE=${MODELCTL_STATE:-$HOME/.modelctl.state}          # current profile name
+PIDFILE=${MODELCTL_PIDFILE:-$HOME/.modelctl.supervisor}   # supervisor pid, if any
+PORT=8080
 HEALTH="http://127.0.0.1:${PORT}/health"
 LOG_DIR="${LOG_DIR:-$HOME/modelctl-logs}"
 mkdir -p "$LOG_DIR"
+
+# Per-deployment experiment knobs (K, SPEC_METRICS, MAMBA_MODE, ...).
+# Keeping them in a file makes an A/B restart a one-line edit.
+[ -f "$HOME/.modelctl.env" ] && . "$HOME/.modelctl.env"
 
 say() { echo "[$(date +%T)] $*"; }
 
@@ -45,10 +48,10 @@ kill_all() {
 profile_cmd() {
   case "$1" in
     vllm-dflash)
-      echo "VLLM_BIN=${VLLM_BIN:-$HOME/vllm-current/bin/vllm} KVBYTES=${KVBYTES:-3865470566} MAXNUM=${MAXNUM:-1024} UTIL=${UTIL:-0.977} SEQ=${SEQ:-4} setsid nohup bash $D/vllm-merkyor-dflash-launch.sh"
+      echo "VLLM_BIN=${VLLM_BIN:-$HOME/vllm-current/bin/vllm} KVBYTES=${KVBYTES:-3865470566} MAXNUM=${MAXNUM:-1024} UTIL=${UTIL:-0.977} SEQ=${SEQ:-4} K=${K:-5} SPEC_METRICS=${SPEC_METRICS:-none} SCHED_TOKENS=${SCHED_TOKENS:-} KV_METRICS=${KV_METRICS:-0} MFU_METRICS=${MFU_METRICS:-0} CG_METRICS=${CG_METRICS:-0} QUEUED_REQS=${QUEUED_REQS:-} MAMBA_MODE=${MAMBA_MODE:-} PCRI=${PCRI:-} GDN_BACKEND=${GDN_BACKEND:-} setsid nohup bash $D/vllm-merkyor-dflash-launch.sh"
       ;;
     vllm-mtp)
-      echo "MAX_JOBS=${MAX_JOBS:-2} MODEL=$MODELS/Merkyor-W4A4/NVFP4/W4A4 MTP_N=3 MAXLEN=${MAXLEN:-150000} setsid nohup bash $D/vllm-merkyor-launch.sh"
+      echo "MAX_JOBS=2 MODEL=$MODELS/Merkyor-W4A4/NVFP4/W4A4 MTP_N=3 MAXLEN=${MAXLEN:-150000} setsid nohup bash $D/vllm-merkyor-launch.sh"
       ;;
     sglang)
       echo "setsid nohup bash $D/sglang-merkyor-launch.sh"
