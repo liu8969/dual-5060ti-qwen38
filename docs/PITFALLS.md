@@ -240,7 +240,11 @@ https://gh-proxy.com/https://github.com/flashinfer-ai/flashinfer/releases/downlo
 |---|---|
 | `~/deploy-5060ti/modelctl` | 运维入口（status/start/stop/restart/logs/bench/supervise） |
 | `/etc/systemd/system/modelctl.service` | systemd 托管（开机自启 + 崩溃重启） |
+| `~/gpu-model-dashboard/` | **独立项目**：8090 实时面板（`dashboard.sh` + `dashboard.py` + `verify.py`）；`modelctl watch` 也调它 |
+| `/etc/systemd/system/gpu-model-dashboard.service` | 面板的 systemd 托管（`enable --now`，重启自愈） |
+| `~/deploy-5060ti/modelwatch.py` | **兼容 shim**（转发到 gpu-model-dashboard，2026-09-12 摘出） |
 | `~/deploy-5060ti/vllm-merkyor-dflash-launch.sh` | 生产启动脚本 |
+| `~/deploy-5060ti/profiles/*.json` + `profile_render.py` + `modelctl.next` | profile 数据化（2026-09-12 落地，尚未接 systemd）——见 `docs/PROFILE-DATA.md` |
 | `~/deploy-5060ti/launch.sh` / `launch-256k-dflash.sh` | llama.cpp 168K / 256K |
 | `~/deploy-5060ti/sglang-merkyor-launch.sh` | SGLang 档 |
 | `~/deploy-5060ti/bench_gsq.py` / `bench_concurrency.py` | 单流 / 并发基准 |
