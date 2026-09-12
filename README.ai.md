@@ -145,9 +145,10 @@ grep -oE 'CUDA out of memory[^)]*|ValueError[^\n]{0,160}|RuntimeError[^\n]{0,160
 | `Killed` with no traceback | host RAM OOM during compilation | `MAX_JOBS=2` |
 | VRAM rises to ~15 GB then drops to 0, repeatedly | two instances fighting | `modelctl stop`, then start once |
 
-## 5b. Watching a live workload (`modelwatch`)
+## 5b. Watching a live workload (the monitor lives in the `gpu-model-dashboard` project)
 
-`modelctl watch [--gpu] [--interval N] [--json] [--once]` runs `scripts/modelwatch.py`: it scrapes the
+`modelctl watch [--gpu] [--interval N] [--json] [--once]` runs the monitor from the separate
+`~/gpu-model-dashboard/` project (entry point `dashboard.py`): it scrapes the
 engine's **Prometheus endpoint** and diffs the counters, so one tool covers all three engines and the
 numbers do not depend on any engine's log format.
 
@@ -181,7 +182,7 @@ agrees in both level and mean (the residual gap is the 10 s window boundary offs
 ### Web dashboard
 
 ```bash
-bash scripts/dashboard.sh start|stop|status    # wraps modelwatch.py --serve, default port 8090
+~/gpu-model-dashboard/dashboard.sh status|start|stop|logs   # the panel is its own project (8090)
 ```
 
 Self-contained single page (inline CSS/JS, no CDN), live via SSE, reconnect on drop: seven tiles
@@ -190,7 +191,8 @@ GPU utilisation-power-VRAM bars, and a rolling table of the last 300 samples.
 
 Run it **on the host that has the GPUs** — a laptop-side instance still reads `/metrics` across the
 network but shows no GPU row, because `nvidia-smi` is local-only. Stop it with
-`pkill -f 'modelwatch.py --serve'`.
+`sudo systemctl stop gpu-model-dashboard` (the unit is installed with `Restart=always`, so a
+pkill would be undone three seconds later).
 
 ## 6. Prebuilt kernels (removes the 5–10 minute compile)
 

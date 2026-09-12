@@ -286,16 +286,26 @@ model id `Qwen3.8-27B-Q6-dual-5060ti`（DSH provider `qwen-local` 依赖此名�
 **Web 仪表盘（推荐，浏览器看）**：`http://192.168.0.119:8090/`
 
 ```bash
-bash ~/deploy-5060ti/dashboard.sh start|stop|status    # 默认 8090，bind 0.0.0.0
+bash ~/gpu-model-dashboard/dashboard.sh start|stop|status   # 默认 8090，bind 0.0.0.0
+bash ~/gpu-model-dashboard/dashboard.sh logs 40             # 面板日志
+python3 ~/gpu-model-dashboard/verify.py                     # 自检（HTTP/SSE/引擎识别/对账）
 ```
 
 单页自包含（内联 CSS/JS，无 CDN），SSE 实时推送，断线自动重连。含 7 个数字卡片
 （prefill / decode / 队列 / KV / 缓存 / 接受度 / 抢占）、4 条自适应曲线、GPU 利用率-功耗-显存条、
 最近 300 条采样滚动表。**必须跑在有 nvidia-smi 的机器上**——笔记本端跑能读到指标但 GPU 行是空的。
 
-**终端方式**：`modelctl watch --gpu`（SSH 里每 2 秒一行）。两者共用 `modelwatch.py`，读数规则相同。
+> **2026-09-12：仪表盘已摘成独立项目 `gpu-model-dashboard`**（服务器 `~/gpu-model-dashboard/`，本地
+> `~/Documents/ubuntu/gpu-model-dashboard/`）。现在由 systemd 单元 `gpu-model-dashboard.service`
+> （`enable` + `Restart=always`）托管、开机自启——原先那个 `~/start-dashboard.sh` 裸进程已退役。
+> `~/deploy-5060ti/` 下与面板相关的残留（旧的 `dashboard.sh` 和 `modelwatch.py` 转发壳）已于
+> 2026-09-12 归档到 `~/deploy-5060ti/old/dashboard/`——**本侧只保留 `modelctl watch` 这一行入口**
+> （它指向新项目），面板本身不在本仓库维护。
+> 项目自带 `verify.py`、`docs/READING-RULES.md`（读数规则完整版）、`README.md`。
 
-`modelctl watch --gpu`（底层 `modelwatch.py`）抓引擎的 Prometheus 端点做计数器差分，**三个引擎通用**
+**终端方式**：`modelctl watch --gpu`（SSH 里每 2 秒一行）。两者共用同一份 `dashboard.py`，读数规则相同。
+
+`modelctl watch --gpu`（底层 `gpu-model-dashboard/dashboard.py`）抓引擎的 Prometheus 端点做计数器差分，**三个引擎通用**
 （vLLM / SGLang / llama.cpp 各自换一套指标名，语义相同）。
 
 ```
@@ -314,13 +324,36 @@ bash ~/deploy-5060ti/dashboard.sh start|stop|status    # 默认 8090，bind 0.0.
    不同 prompt 之间的 accept% 不能横向比。
 4. 第一帧显示 `-` 是对的（算速率需要两个采样点）；llama.cpp 若没加 `--metrics` 会明确报"识别不了"而不是显示 0。
 
-**对账结论**：与引擎自身日志相比，`prefill` 和 `running` 精确一致，`decode` 均值差 8%（10 秒窗口边界偏移）。
+**对账结论（2026-09-12 重做，方法已修正）**：与引擎自身日志逐窗口比对（`gpu-model-dashboard/verify.py --reconcile`）：
+
+| 指标 | 实测一致性 |
+|---|---|
+| `decode` | 均值差 **1–9%**（窗口边界偏移）——硬判据 ≤20% |
+| `prefill` | 有真实计算量时 **0.2%**；前缀缓存全命中的窗口我们读 0、日志仍报几千 tok/s |
+| `running` | 精确一致 |
+
+**两个坑（原"prefill 精确一致 / decode 差 8%"的结论就是这么得出来的）**：
+
+1. **日志窗口长度不是固定 10 秒**：vLLM 不保证每 10 秒打一行，长预填充时会跳（实测 `04:43:43 →
+   04:44:13` 跳了 30 秒），那一行的 `7923.9 tokens/s` 覆盖的是 **30 秒**累计。必须用**日志自己相邻两行**
+   的时间戳算窗口长度，否则直接差 3 倍。
+2. **两个独立相位的窗口均值不可比**：突发负载下相位误差能到 30%+（实测 decode 差 1.0% 时 prefill 差 33.3%）。
+   正确做法：1–2 秒细粒度连续采样 + 按日志时间戳分桶逐窗口比。
+
+另外 `prefill` 在缓存命中窗口会出现"我们 0 / 日志几千"：日志报的是调度器窗口内处理的提示 token（含缓存命中
+的部分），而 `vllm:prompt_tokens_total` 只统计真正做了前向的 token。**所以对账别看 prefill，看 decode。**
+
+> 仪表盘的 `cache%` 是**累计** hits÷queries（卡片下标 `cumulative`）；引擎日志里那个才是每 10 秒窗口值。
+> 两者别混（§8.1d 规则 2）。完整读数规则：`gpu-model-dashboard/docs/READING-RULES.md`。
 
 ### 8.2 运维工具
 
 - `~/deploy-5060ti/modelctl`：`status | start <profile> | stop | restart | logs [n] | bench | supervise <profile>`；
   启动时每 30 s 打印进度，进程死掉**立即报错退出**，不盲等。profiles：`vllm-dflash`（生产）、
   `vllm-mtp`、`sglang`、`llama168`、`llama256`。
+- `~/gpu-model-dashboard/`：**独立项目**（2026-09-12 从本仓库摘出）——`dashboard.sh`
+  （start/stop/restart/status/logs/install/uninstall）、`dashboard.py`（原 modelwatch.py）、`verify.py`、
+  systemd 单元模板。8090 面板的唯一入口；`modelctl watch` 也改为调用它的 `dashboard.py`。
 - systemd 单元 `/etc/systemd/system/modelctl.service`（`Restart=always` + `enable`）：崩溃自动重启、开机自启。
   实测 `kill -9` 掉 vLLM → 90 秒自动恢复；`systemctl restart modelctl` → 66 秒恢复。
 - 操作规程：`~/.dsh/skills/model-ops/SKILL.md`（DSH 技能目录，会话自动可用）。
@@ -663,8 +696,8 @@ request 2（同）:  prompt_tokens_details = {cached_tokens: 1824, created_cache
 
 - pi-ai 读缓存**写入**用的字段名是 `cache_write_tokens`，而 vLLM 报的是 `created_cache_tokens`
   —— 名字不一致，所以「缓存写入」那条永远是 0。对命中率没影响（分母仍是 prompt_tokens）。
-- 别把 `modelwatch.py` 仪表盘上的 `cache%` 和这个混为一谈：那是**每 10 秒窗口**的值，
-  空闲窗口天然 0.0%；DSH 这个是全日志累计（见 §8.1d 的三条读数规则）。
+- 别把仪表盘上的 `cache%` 和这个混为一谈：**仪表盘是累计** hits÷queries（卡片下标 `cumulative`），
+  引擎日志里那个才是**每 10 秒窗口**的值、空闲窗口天然 0.0%；DSH 这个是全日志累计（见 §8.1d 读数规则）。
 
 **⚠️ 同时踩到的坑（改启动脚本必看）**：往**反斜杠续行链中间**插 `#` 注释会**打断命令**——
 续行合并后 `#` 起注释作用，吞掉该逻辑行剩余部分，于是后面每个 `--flag \` 都变成独立命令，

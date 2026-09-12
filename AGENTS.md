@@ -25,6 +25,8 @@ only the part an agent must never get wrong.
 bash ~/deploy-5060ti/modelctl status | start vllm-dflash | stop | logs 80 | bench
 bash ~/deploy-5060ti/modelctl watch --gpu    # live prefill/decode, works on vLLM/SGLang/llama.cpp
 bash ~/deploy-5060ti/modelctl watch --serve --bind 0.0.0.0 --port 8090   # web dashboard
+#   ^ the monitor/panel are the separate ~/gpu-model-dashboard/ project; this repo only
+#     keeps the `modelctl watch` entry point. Leftovers are in ~/deploy-5060ti/old/dashboard/
 sudo systemctl restart modelctl
 bash <repo>/bench.sh          # full suite → results/bench-<ts>.md
 ```

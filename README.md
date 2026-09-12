@@ -41,7 +41,7 @@ bash bench.sh                 # 复现下面的数字
 
 ```bash
 # 在跑服务的机器上（要能访问 nvidia-smi）
-bash scripts/dashboard.sh start          # 包装了 modelwatch.py --serve，默认 8090
+bash ~/gpu-model-dashboard/dashboard.sh start   # 面板已独立成项目（默认 8090），本仓库不再维护它
 # 浏览器打开 http://<host>:8090
 ```
 
@@ -85,9 +85,9 @@ bash scripts/dashboard.sh start          # 包装了 modelwatch.py --serve，默
 | `install.sh` | 一键安装（幂等，支持 `DRY_RUN=1`） |
 | `bench.sh` | 基准测试 → `results/bench-<时间戳>.md` |
 | `modelctl watch --gpu` | 盯住正在跑的负载：每 2 秒一行 prefill/decode/queue/KV/cache/accept |
-| `modelwatch.py --serve` | **Web 仪表盘**：实时曲线 + 数字卡片 + GPU，浏览器打开即用 |
+| `~/gpu-model-dashboard/` | **Web 仪表盘**（独立项目）：实时曲线 + 数字卡片 + GPU，浏览器打开即用 |
 | `scripts/modelctl` | 运维 CLI（status/start/stop/restart/logs/bench/**watch**/supervise） |
-| `scripts/modelwatch.py` | **实时监控**：prefill / decode / 队列 / KV / 缓存命中 / 投机接受度，兼容 vLLM·SGLang·llama.cpp |
+| `modelctl watch` | **实时监控**：prefill / decode / 队列 / KV / 缓存命中 / 投机接受度，兼容 vLLM·SGLang·llama.cpp（实现在 `~/gpu-model-dashboard/`） |
 | `README.ai.md` | **给 AI 的详细手册**（参数原理、诊断树、失败签名、运维规程） |
 | `AGENTS.md` | 给 AI 的硬规则摘要 |
 | `docs/PITFALLS.md` | 踩坑全集 |
