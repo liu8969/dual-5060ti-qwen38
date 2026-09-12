@@ -232,7 +232,15 @@ run install -m 0755 "$SRC_DIR/scripts/modelctl" "$INSTALL_DIR/modelctl"
 run install -m 0755 "$SRC_DIR/scripts/vllm-merkyor-dflash-launch.sh" "$INSTALL_DIR/vllm-merkyor-dflash-launch.sh"
 run install -m 0644 "$SRC_DIR/scripts/bench_gsq.py" "$INSTALL_DIR/bench_gsq.py"
 run install -m 0644 "$SRC_DIR/scripts/bench_concurrency.py" "$INSTALL_DIR/bench_concurrency.py"
-ok "scripts installed into $INSTALL_DIR"
+
+# modelctl IS the profile runner: it reads bin/args/env from profiles/*.json through
+# profile_render.py. Without these two, `modelctl start` cannot render anything.
+run install -m 0755 "$SRC_DIR/scripts/profile_render.py" "$INSTALL_DIR/profile_render.py"
+run install -d -m 0755 "$INSTALL_DIR/profiles"
+for _profile in "$SRC_DIR"/profiles/*.json; do
+  run install -m 0644 "$_profile" "$INSTALL_DIR/profiles/$(basename "$_profile")"
+done
+ok "scripts installed into $INSTALL_DIR (modelctl + profile_render.py + profiles/)"
 
 # point the launch script at this machine's paths
 if [ "$DRY_RUN" = "0" ]; then

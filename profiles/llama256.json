@@ -1,6 +1,6 @@
 {
   "schema": "modelctl/profile@1",
-  "_note": "原来由 modelctl 的 case 分支 + $D/launch-256k-dflash.sh 拼出来。分支里 MODEL=$MODELS/... 同样踩了 MODELS 未定义（会渲染成 /GSQ-RCO/...），这里改成 ${MODELS:-/home/lcy/Models}。分支覆盖脚本默认值的三项保留：KVT=q8_0、CTX=262144、SPLIT=layer（脚本自身默认是 q4_0 / tensor）。",
+  "_note": "原来由 modelctl 的 case 分支 + $D/launch-256k-dflash.sh 拼出来。分支里 MODEL=$MODELS/... 同样踩了 MODELS 未定义（会渲染成 /GSQ-RCO/...），这里改成 ${MODELS:-/home/lcy/Models}。分支覆盖脚本默认值的三项保留：KVT=q8_0、CTX=262144、SPLIT=layer（脚本自身默认是 q4_0 / tensor）。另外补了 --alias：脚本原本没写 alias，服务端 id 会变成 gguf 路径，而 8080 端口的 id 必须是 Qwen3.8-27B-Q6-dual-5060ti（铁律 11）。",
   "project": {
     "id": "deploy-5060ti",
     "name": "deploy-5060ti",
@@ -19,6 +19,7 @@
     "args": [
       "serve",
       "--model", "${MODEL:-${MODELS:-/home/lcy/Models}/GSQ-RCO/Qwen3.8-27B-GSQ-RCO-IQ3_S.gguf}",
+      "--alias", "${SERVED_MODEL:-Qwen3.8-27B-Q6-dual-5060ti}",
       "--model-draft", "${DRAFT:-${MODELS:-/home/lcy/Models}/Qwen3.8-27B-DFlash2/Qwen3.8-27B-DFlash2-Q4_K_M.gguf}",
       "--spec-type", "ngram-map-k4v,draft-dflash",
       "--spec-ngram-map-k4v-size-n", "12",

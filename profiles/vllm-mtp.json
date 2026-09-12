@@ -1,6 +1,6 @@
 {
   "schema": "modelctl/profile@1",
-  "_note": "原来由 modelctl 的 case 分支 + $D/vllm-merkyor-launch.sh 两处拼出来（旧分支里 MODEL=$MODELS/... 在 MODELS 未定义时会渲染成 /Merkyor-... —— 这个 profile 当时实际上是起不来的；这里改成 ${MODELS:-/home/lcy/Models}，行为回到脚本原本的默认值）。",
+  "_note": "原来由 modelctl 的 case 分支 + $D/vllm-merkyor-launch.sh 两处拼出来（旧分支里 MODEL=$MODELS/... 在 MODELS 未定义时会渲染成 /Merkyor-... —— 这个 profile 当时实际上是起不来的；这里改成 ${MODELS:-/home/lcy/Models}，行为回到脚本原本的默认值）。另有一处**有意**的改动：脚本的 SERVED_MODEL 默认是 qwen3.8-27b-merkyor，这里改成与其它档一致的 Qwen3.8-27B-Q6-dual-5060ti（8080 端口的 id 必须是它，DSH provider 依赖这条；想回到旧行为就 SERVED_MODEL=qwen3.8-27b-merkyor）。",
   "project": {
     "id": "deploy-5060ti",
     "name": "deploy-5060ti",
@@ -26,7 +26,7 @@
     "args": [
       "serve",
       "${MODEL:-${MODELS:-/home/lcy/Models}/Merkyor-W4A4/NVFP4/W4A4}",
-      "--served-model-name", "${SERVED_MODEL:-qwen3.8-27b-merkyor}",
+      "--served-model-name", "${SERVED_MODEL:-Qwen3.8-27B-Q6-dual-5060ti}",
       "--host", "0.0.0.0",
       "--port", "8080",
       "--tensor-parallel-size", "2",
