@@ -7,7 +7,7 @@
 #   modelctl restart <profile>
 #   modelctl logs [n]          tail the current profile's log
 #   modelctl bench             short decode benchmark against :8080
-#   modelctl watch [args...]    live prefill/decode/queue/cache monitor
+#   modelctl watch [args...]    live monitor (gpu-model-dashboard project)
 #   modelctl supervise <profile>   keep it alive (restart on crash)
 #
 # Profiles:
@@ -153,7 +153,10 @@ cmd_status() {
 
 cmd_logs() { tail -n "${1:-40}" "$(log_for "$(cat "$STATE" 2>/dev/null || echo unknown)")" 2>/dev/null || echo "no log"; }
 
-cmd_watch() { python3 "$D/modelwatch.py" "$@"; }
+# The monitor itself lives in its own project (extracted 2026-09-12):
+#   ~/gpu-model-dashboard/  — dashboard.py (monitor) + dashboard.sh (control)
+# Override with MODELWATCH_PY if it is installed elsewhere.
+cmd_watch() { python3 "${MODELWATCH_PY:-$HOME/gpu-model-dashboard/dashboard.py}" "$@"; }
 
 cmd_bench() {
   python3 "$D/bench_gsq.py" 2>&1 | head -3

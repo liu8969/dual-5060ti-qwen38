@@ -54,6 +54,9 @@ if [ -n "${KVBYTES:-}" ]; then EXTRA_ARGS+=(--kv-cache-memory "$KVBYTES"); fi
 
 SPEC=$(printf '{"model":"%s","method":"dflash","num_speculative_tokens":%s,"quantization":"compressed-tensors","draft_tensor_parallel_size":2}' "$DRAFT" "$K")
 
+# 2026-09-12: vLLM defaults enable_prompt_tokens_details=False, so
+# usage.prompt_tokens_details stays null and cache-hit consumers
+# (pi-ai -> DSH) can only ever read 0. Usage reporting only.
 exec "$VLLM_BIN" serve "$MODEL" \
   --served-model-name "$SERVED_MODEL" \
   --host 0.0.0.0 --port 8080 \
@@ -72,6 +75,7 @@ exec "$VLLM_BIN" serve "$MODEL" \
   --speculative-config "$SPEC" \
   --no-enable-flashinfer-autotune \
   --enable-prefix-caching \
+  --enable-prompt-tokens-details \
   --disable-custom-all-reduce \
   --language-model-only \
   --enable-auto-tool-choice \

@@ -1,49 +1,56 @@
 #!/usr/bin/env bash
-# dashboard.sh start|stop|status — the modelwatch web UI as a managed background process.
+# dashboard.sh — DEPRECATED 2026-09-12: the GPU model dashboard is now its own project.
 #
-#   bash ~/deploy-5060ti/dashboard.sh start [port]
-#   bash ~/deploy-5060ti/dashboard.sh stop
+#     ~/gpu-model-dashboard/      dashboard.py (monitor) + dashboard.sh (control) + README.md
+#
+# This file is kept only as a forwarding shim for old muscle memory and scripts.
+# Lifecycle goes through systemd: the panel is installed as
+# `gpu-model-dashboard.service` with Restart=always/RestartSec=3, so a `stop`
+# implemented as pkill would have the panel back three seconds later — the same
+# trap documented for `modelctl stop` under systemd.
+#
+#   status | logs | healthz   -> forwarded to the new project's dashboard.sh
+#   start | stop | restart    -> systemctl on the unit (falls back to the new
+#                                script when no unit is installed)
+#
 #   bash ~/deploy-5060ti/dashboard.sh status
 set -uo pipefail
 
-D="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PORT="${2:-8090}"
-URL="${DASH_URL:-http://127.0.0.1:8080}"
-PIDFILE="$HOME/.modelwatch.pid"
-LOG="$HOME/modelwatch-dashboard.log"
-PATTERN='[m]odelwatch.py --serve'          # bracketed so the pattern cannot match this script
+NEW="${GPU_MODEL_DASHBOARD:-$HOME/gpu-model-dashboard/dashboard.sh}"
+UNIT="gpu-model-dashboard.service"
+UNIT_PATH="/etc/systemd/system/$UNIT"
+verb="${1:-status}"
 
-is_up() { curl -s -m 3 -o /dev/null "http://127.0.0.1:${PORT}/" 2>/dev/null; }
+warn() {
+  echo "note: ~/deploy-5060ti/dashboard.sh is a forwarding shim; the project now lives in ~/gpu-model-dashboard" >&2
+}
 
-case "${1:-status}" in
-  start)
-    if is_up; then echo "already running: http://$(hostname -I | awk '{print $1}'):${PORT}/"; exit 0; fi
-    setsid nohup python3 "$D/modelwatch.py" --serve --bind 0.0.0.0 --port "$PORT" \
-      --url "$URL" --interval 2 > "$LOG" 2>&1 < /dev/null &
-    echo $! > "$PIDFILE"
-    for _ in $(seq 1 20); do
-      if is_up; then
-        IP=$(hostname -I | awk '{print $1}')
-        echo "dashboard up: http://${IP}:${PORT}/   (pid $(cat "$PIDFILE"), log $LOG)"
-        exit 0
-      fi
-      sleep 0.5
-    done
-    echo "failed to start — last log lines:"; tail -5 "$LOG"; exit 1
+if [ ! -x "$NEW" ]; then
+  cat >&2 <<EOF
+dashboard.sh has moved: $NEW not found.
+
+The GPU model dashboard is its own project now. Put it at \$HOME/gpu-model-dashboard
+(or point GPU_MODEL_DASHBOARD at wherever it lives), then re-run.
+EOF
+  exit 1
+fi
+
+case "$verb" in
+  status|logs|healthz)
+    warn
+    exec "$NEW" "$@"
     ;;
-  stop)
-    pkill -f "$PATTERN" 2>/dev/null && echo "stopped" || echo "not running"
-    rm -f "$PIDFILE"
-    ;;
-  status)
-    if is_up; then
-      IP=$(hostname -I | awk '{print $1}')
-      echo "running: http://${IP}:${PORT}/  (pid $(pgrep -f "$PATTERN" | head -1), log $LOG)"
-    else
-      echo "not running (port $PORT)"
+  start|stop|restart)
+    warn
+    if command -v systemctl >/dev/null 2>&1 && [ -f "$UNIT_PATH" ]; then
+      echo "-> sudo systemctl $verb $UNIT" >&2
+      exec sudo systemctl "$verb" "$UNIT"
     fi
+    echo "-> no systemd unit installed; falling back to $NEW $verb" >&2
+    exec "$NEW" "$@"
     ;;
   *)
-    sed -n '2,8p' "$0"
+    warn
+    exec "$NEW" "$@"
     ;;
 esac
