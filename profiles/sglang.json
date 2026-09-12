@@ -1,0 +1,77 @@
+{
+  "schema": "modelctl/profile@1",
+  "_note": "唯一一个「启动动作不是一条 argv」的档：镜像是容器，所以 bin=docker，前置动作（建 HF 缓存目录、清同名容器）放进 pre，收尾放进 stop。旧 modelctl 的 kill_all 是 docker rm -f $(docker ps -aq)（清掉所有容器），这里收窄成只清自己这个。",
+  "project": {
+    "id": "deploy-5060ti",
+    "name": "deploy-5060ti",
+    "work_dir": "/home/lcy/deploy-5060ti",
+    "environment_command": ". $HOME/.modelctl.env"
+  },
+  "profile": {
+    "id": "sglang",
+    "name": "sglang",
+    "engine": "sglang",
+    "description": "对照档：SGLang 容器（dev-qwen38-27b-dflash2） + Merkyor W4A4 + DFlash2-FP8，fp8_e4m3 KV，163840 ctx",
+    "bin": "docker",
+    "pre": [
+      "mkdir -p \"${HF_HOME:-$HOME/.cache/huggingface}\"",
+      "docker rm -f \"${NAME:-sglang-merkyor}\" >/dev/null 2>&1 || true"
+    ],
+    "stop": [
+      "docker rm -f \"${NAME:-sglang-merkyor}\" >/dev/null 2>&1 || true"
+    ],
+    "detect": [
+      "docker inspect -f '{{.State.Running}}' \"${NAME:-sglang-merkyor}\" 2>/dev/null | grep -q true"
+    ],
+    "args": [
+      "run", "-d",
+      "--name", "${NAME:-sglang-merkyor}",
+      "--init",
+      "--gpus", "all",
+      "--ipc=host",
+      "--shm-size=16g",
+      "-p", "${PORT:-8080}:8000",
+      "--ulimit", "memlock=-1:-1",
+      "--ulimit", "stack=67108864",
+      "-e", "HF_ENDPOINT=https://hf-mirror.com",
+      "-e", "HF_HUB_DISABLE_XET=1",
+      "-e", "TRITON_DISABLE_AUTOTUNE=1",
+      "-e", "TRITON_ALWAYS_COMPILE=1",
+      "-v", "${HF_HOME:-$HOME/.cache/huggingface}:/root/.cache/huggingface",
+      "-v", "$HOME/.triton:/root/.triton",
+      "-v", "/home/lcy/Models:/models",
+      "${IMAGE:-docker.m.daocloud.io/lmsysorg/sglang:dev-qwen38-27b-dflash2}",
+      "python3", "-m", "sglang.launch_server",
+      "--model-path", "${TARGET:-/models/Merkyor-W4A4/NVFP4/W4A4}",
+      "--speculative-algorithm", "DFLASH",
+      "--speculative-draft-model-path", "${DRAFT:-/models/Merkyor-W4A4/NVFP4/W4A4/DFlash2-FP8}",
+      "--speculative-draft-model-quantization", "compressed-tensors",
+      "--speculative-num-draft-tokens", "${DRAFT_TOKENS:-8}",
+      "--speculative-draft-window-size", "8192",
+      "--mamba-radix-cache-strategy", "extra_buffer_lazy",
+      "--mamba-ssm-dtype", "bfloat16",
+      "--max-mamba-cache-size", "${MAMBA_SLOTS:-5}",
+      "--mem-fraction-static", "${MEM_FRACTION:-0.92}",
+      "--max-running-requests", "${MAX_REQS:-1}",
+      "--tp", "2",
+      "--kv-cache-dtype", "fp8_e4m3",
+      "--attention-backend", "flashinfer",
+      "--disable-flashinfer-autotune",
+      "--disable-custom-all-reduce",
+      "--language-only",
+      "--disable-prefill-cuda-graph",
+      "--cuda-graph-max-bs-decode", "1",
+      "--context-length", "${CTX:-163840}",
+      "--reasoning-parser", "qwen3",
+      "--tool-call-parser", "qwen3_coder",
+      "--host", "0.0.0.0",
+      "--port", "8000",
+      "--served-model-name", "${SERVED_NAME:-Qwen3.8-27B-Q6-dual-5060ti}"
+    ],
+    "health": "http://127.0.0.1:8080/health",
+    "metrics": "http://127.0.0.1:8080/metrics",
+    "log": "$HOME/modelctl-logs/sglang.log",
+    "ready_pattern": "fired up and ready to roll",
+    "startup_budget_s": [60, 300]
+  }
+}

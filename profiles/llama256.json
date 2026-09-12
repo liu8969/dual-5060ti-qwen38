@@ -1,0 +1,58 @@
+{
+  "schema": "modelctl/profile@1",
+  "_note": "原来由 modelctl 的 case 分支 + $D/launch-256k-dflash.sh 拼出来。分支里 MODEL=$MODELS/... 同样踩了 MODELS 未定义（会渲染成 /GSQ-RCO/...），这里改成 ${MODELS:-/home/lcy/Models}。分支覆盖脚本默认值的三项保留：KVT=q8_0、CTX=262144、SPLIT=layer（脚本自身默认是 q4_0 / tensor）。",
+  "project": {
+    "id": "deploy-5060ti",
+    "name": "deploy-5060ti",
+    "work_dir": "/home/lcy/deploy-5060ti",
+    "environment_command": ". $HOME/.modelctl.env"
+  },
+  "profile": {
+    "id": "llama256",
+    "name": "llama256",
+    "engine": "llama.cpp",
+    "description": "llama.cpp GSQ-RCO IQ3_S 权重 + DFlash2-Q4_K_M 草稿 + ngram-map-k4v，q8_0 KV，262144 ctx，单槽（--no-kv-unified）",
+    "bin": "${LLAMA_BIN:-$HOME/llama.cpp/build/bin/llama}",
+    "env": {
+      "CUDA_VISIBLE_DEVICES": "0,1"
+    },
+    "args": [
+      "serve",
+      "--model", "${MODEL:-${MODELS:-/home/lcy/Models}/GSQ-RCO/Qwen3.8-27B-GSQ-RCO-IQ3_S.gguf}",
+      "--model-draft", "${DRAFT:-${MODELS:-/home/lcy/Models}/Qwen3.8-27B-DFlash2/Qwen3.8-27B-DFlash2-Q4_K_M.gguf}",
+      "--spec-type", "ngram-map-k4v,draft-dflash",
+      "--spec-ngram-map-k4v-size-n", "12",
+      "--spec-ngram-map-k4v-size-m", "48",
+      "--spec-ngram-map-k4v-min-hits", "1",
+      "--spec-draft-n-max", "5",
+      "--spec-draft-p-min", "0.4",
+      "--cache-type-k", "${KVT:-q8_0}",
+      "--cache-type-v", "${KVT:-q8_0}",
+      "--n-gpu-layers", "99",
+      "--n-gpu-layers-draft", "99",
+      "--ctx-size", "${CTX:-262144}",
+      "--batch-size", "2048",
+      "--ubatch-size", "512",
+      "--flash-attn", "on",
+      "--jinja",
+      "--no-kv-unified",
+      "--parallel", "1",
+      "--ctx-checkpoints", "${CTXCP:-2}",
+      "--cache-ram", "4096",
+      "--no-warmup",
+      "--split-mode", "${SPLIT:-layer}",
+      "--tensor-split", "${TSPLIT:-50,50}",
+      "--reasoning", "on",
+      "--reasoning-budget", "8192",
+      "--host", "0.0.0.0",
+      "--port", "${PORT:-8080}"
+    ],
+    "health": "http://127.0.0.1:8080/health",
+    "metrics": "http://127.0.0.1:8080/metrics",
+    "kill": [
+      "pkill -9 -x llama"
+    ],
+    "log": "$HOME/modelctl-logs/llama256.log",
+    "startup_budget_s": [30, 180]
+  }
+}

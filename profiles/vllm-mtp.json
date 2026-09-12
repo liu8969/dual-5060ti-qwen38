@@ -1,0 +1,62 @@
+{
+  "schema": "modelctl/profile@1",
+  "_note": "原来由 modelctl 的 case 分支 + $D/vllm-merkyor-launch.sh 两处拼出来（旧分支里 MODEL=$MODELS/... 在 MODELS 未定义时会渲染成 /Merkyor-... —— 这个 profile 当时实际上是起不来的；这里改成 ${MODELS:-/home/lcy/Models}，行为回到脚本原本的默认值）。",
+  "project": {
+    "id": "deploy-5060ti",
+    "name": "deploy-5060ti",
+    "work_dir": "/home/lcy/deploy-5060ti",
+    "environment_command": ". $HOME/.modelctl.env"
+  },
+  "profile": {
+    "id": "vllm-mtp",
+    "name": "vllm-mtp",
+    "engine": "vllm",
+    "description": "对照档：Merkyor W4A4 + 内置 BF16 MTP-3，FP8 KV，TRITON_ATTN 硬编码，150K（用 0.28 的 ~/vllm-venv）",
+    "bin": "${VLLM28_BIN:-$HOME/vllm-venv/bin/vllm}",
+    "env": {
+      "CUDA_HOME": "/usr/local/cuda",
+      "LD_LIBRARY_PATH": "/usr/local/cuda/lib64",
+      "PATH": "/usr/local/cuda-13.3/bin:$PATH",
+      "HF_ENDPOINT": "https://hf-mirror.com",
+      "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+      "VLLM_ALLOW_LONG_MAX_MODEL_LEN": "1",
+      "VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE": "16777216",
+      "MAX_JOBS": "${MAX_JOBS:-2}"
+    },
+    "args": [
+      "serve",
+      "${MODEL:-${MODELS:-/home/lcy/Models}/Merkyor-W4A4/NVFP4/W4A4}",
+      "--served-model-name", "${SERVED_MODEL:-qwen3.8-27b-merkyor}",
+      "--host", "0.0.0.0",
+      "--port", "8080",
+      "--tensor-parallel-size", "2",
+      "--dtype", "bfloat16",
+      "--kv-cache-dtype", "fp8",
+      "--attention-backend", "TRITON_ATTN",
+      "--mamba-cache-dtype", "bfloat16",
+      "--mamba-ssm-cache-dtype", "bfloat16",
+      "--gpu-memory-utilization", "${UTIL:-0.977}",
+      "--max-model-len", "${MAXLEN:-150000}",
+      "--max-num-seqs", "3",
+      "--max-num-batched-tokens", "1024",
+      "--enable-chunked-prefill",
+      "--speculative-config", "{\"method\":\"mtp\",\"num_speculative_tokens\":${MTP_N:-3}}",
+      "--no-enable-flashinfer-autotune",
+      "--no-enable-prefix-caching",
+      "--disable-custom-all-reduce",
+      "--language-model-only",
+      "--enable-auto-tool-choice",
+      "--tool-call-parser", "qwen3_xml",
+      "--reasoning-parser", "qwen3",
+      "--generation-config", "vllm"
+    ],
+    "health": "http://127.0.0.1:8080/health",
+    "metrics": "http://127.0.0.1:8080/metrics",
+    "kill": [
+      "pkill -9 -f 'vllm serve'",
+      "pkill -9 -f 'EngineCore'"
+    ],
+    "log": "$HOME/modelctl-logs/vllm-mtp.log",
+    "startup_budget_s": [66, 200]
+  }
+}

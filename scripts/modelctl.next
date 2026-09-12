@@ -1,0 +1,374 @@
+#!/usr/bin/env bash
+# modelctl.next — 通用 profile 运行器（第二阶段候选：接管生产前先用 --dry-run 比对）
+#
+# 一个 profile = ~/deploy-5060ti/profiles/<name>.json 里的数据：
+#   project.work_dir / project.environment_command   —— 环境路径 + 准备命令
+#   profile.bin + profile.args                       —— 具体启动 argv
+#   profile.env                                      —— 只属于这个档的环境变量
+#   profile.pre / profile.stop / profile.kill        —— 容器档才需要的前置/收尾/兜底清理
+#   profile.detect                                   —— 「进程还活着吗」的自定义探针（容器档用）
+#   profile.health / profile.log                     —— 就绪判据与日志位置
+# 脚本本身不认识任何引擎（没有 vllm/sglang/llama.cpp 枚举，没有引擎专属参数）。
+#
+# CLI 与现有 modelctl 保持一致，便于原地替换：
+#   modelctl.next list | show <p> | start <p> [--dry-run] | stop [p] [--dry-run]
+#                | restart <p> | status | logs [n] | supervise <p> | watch [args...] | bench
+#
+# 安全约定：
+#  · stop 的兜底 pkill 只在「知道当前是哪个 profile」时才跑（显式参数 / STATE /
+#    MODELCTL_PROFILE 三者之一）。认不出来就只回收自己拉起的进程组，绝不猜一个档
+#    去打 —— 猜错会 pkill 掉正在跑的服务。
+#  · cmd_start 内部只收「服务」（teardown_service），不碰守护进程；守护进程自杀会
+#    让 systemd 走 ExecStop，把刚拉起来的服务再杀一次。
+#  · 拿这套脚本做自测时，STATE / PIDFILE / RUNFILE 三个文件**必须一起**改到临时路径，
+#    只改 PROFILES_DIR 会让自测的 stop 摸到生产的守护进程 pid。
+set -uo pipefail
+
+D="${DEPLOY_DIR:-/home/lcy/deploy-5060ti}"
+PROFILES="${PROFILES_DIR:-$D/profiles}"
+RENDER="${RENDER:-$D/profile_render.py}"
+ENV_LAYER="${MODELCTL_ENV:-$HOME/.modelctl.env}"
+STATE="${MODELCTL_STATE:-$HOME/.modelctl.state}"          # 当前 profile 名
+PIDFILE="${MODELCTL_PIDFILE:-$HOME/.modelctl.supervisor}" # 守护进程 pid
+RUNFILE="${MODELCTL_RUNFILE:-$HOME/.modelctl.run}"        # 被拉起的进程组 pid
+PY="${PY:-python3}"
+
+say() { echo "[$(date +%T)] $*"; }
+die() { echo "modelctl: $*" >&2; exit 1; }
+
+profile_file() { local f="$PROFILES/$1.json"; [ -f "$f" ] || die "no such profile '$1' ($f)"; printf '%s' "$f"; }
+
+# STATE 里没有名字时**绝不猜**一个 profile：猜错的代价是拿别的档的兜底 pkill 去打
+# 正在跑的服务（真事：自测时 STATE 指向临时目录、没建过，旧写法回落到
+# vllm-dflash，于是 `start test` 顺手把生产 vLLM pkill 了）。
+# 认不出来就返回空 —— 那种情况下只回收本脚本自己拉起的进程组。
+current_profile() { [ -f "$STATE" ] && head -n1 "$STATE" 2>/dev/null; }
+
+# stop 用哪个 profile 的 stop/kill 数据：显式参数 > STATE 里那个真实存在的档
+# > systemd 单元的 MODELCTL_PROFILE。都没有就返回空（不猜）。
+profile_for_stop() {
+  local p="${1:-}" cand
+  if [ -z "$p" ]; then
+    for cand in "$(current_profile)" "${MODELCTL_PROFILE:-}"; do
+      [ -n "$cand" ] && [ -f "$PROFILES/$cand.json" ] && { p="$cand"; break; }
+    done
+  fi
+  [ -n "$p" ] && [ -f "$PROFILES/$p.json" ] && printf '%s' "$p"
+}
+
+# 单个 JSON 字段（点号路径），拿不到就打默认值
+pfield() { # pfield <file> <dotted.key> [default]
+  "$PY" - "$1" "$2" "${3:-}" <<'PY'
+import json, sys
+doc = json.load(open(sys.argv[1], encoding="utf-8"))
+cur = doc
+for part in sys.argv[2].split("."):
+    if not isinstance(cur, dict) or part not in cur:
+        print(sys.argv[3]); raise SystemExit
+    cur = cur[part]
+print("" if cur is None else cur)
+PY
+}
+
+# 覆盖层：~/.modelctl.env 里的变量必须导出（set -a），否则渲染器看不到
+# —— 这是 A/B 实验通道（K、ATTN、MAXNUM…），行为与旧 modelctl 一致。
+load_env_layer() { if [ -f "$ENV_LAYER" ]; then set -a; . "$ENV_LAYER"; set +a; fi; }
+
+apply_profile_env() {
+  local line
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    export "${line%%=*}=${line#*=}"
+  done < <("$PY" "$RENDER" "$1" --env)
+}
+
+render_argv() {  # 把 profile 渲染成全局数组 ARGV
+  mapfile -d '' -t ARGV < <("$PY" "$RENDER" "$1" --argv-nul)
+  [ "${#ARGV[@]}" -ge 2 ] || die "renderer produced no argv for $1"
+}
+
+render_list() { "$PY" "$RENDER" "$1" --"$2"-nul | tr '\0' '\n'; }
+
+run_list() { # run_list <file> <key> <label> —— 逐条 eval，失败只告警不中断
+  local line
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    say "  $3: $line"
+    eval "$line" || say "  warn: '$line' returned non-zero"
+  done < <(render_list "$1" "$2")
+}
+
+log_path() { "$PY" "$RENDER" "$1" --log; }
+health_url() { pfield "$1" "profile.health" "http://127.0.0.1:8080/health"; }
+
+alive() { curl -s --max-time 3 "$(health_url "$1")" >/dev/null 2>&1; }
+
+# 启动后进程是否还在：自报的探针优先（容器档 docker run -d 之后 $! 立刻退出），
+# 否则看我们拉起的那条进程组。
+launched_alive() {
+  local pid probes
+  while IFS= read -r probes; do
+    [ -n "$probes" ] || continue
+    eval "$probes" >/dev/null 2>&1 && return 0
+  done < <(render_list "$1" detect)
+  pid=$(cat "$RUNFILE" 2>/dev/null) || return 1
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+first_model_id() {
+  curl -s --max-time 5 "http://127.0.0.1:8080/v1/models" \
+    | "$PY" -c 'import json,sys; d=json.load(sys.stdin)["data"]; print(d[0]["id"] if d else "")' 2>/dev/null
+}
+
+kv_pool_line() {
+  grep -oE 'GPU KV cache size: [0-9,]+ tokens|max_total_num_tokens=[0-9]+|KV Cache is allocated[^,]*,[^,]*' "$1" 2>/dev/null | tail -1
+}
+
+report_ready() { # start 之后必须报的三个数字：health + KV 池 + 每卡显存
+  local f="$1" log; log=$(log_path "$f")
+  echo "health  : OK ($(health_url "$f"))"
+  local mid; mid=$(first_model_id); [ -n "$mid" ] && echo "model   : $mid"
+  local kv; kv=$(kv_pool_line "$log"); [ -n "$kv" ] && echo "kv pool : $kv"
+  nvidia-smi --query-gpu=index,memory.used,utilization.gpu,temperature.gpu --format=csv,noheader | sed 's/^/gpu     : /'
+}
+
+cmd_list() {
+  local f
+  for f in "$PROFILES"/*.json; do
+    [ -e "$f" ] || continue
+    "$PY" - "$f" <<'PY'
+import json, sys
+p = json.load(open(sys.argv[1], encoding="utf-8"))["profile"]
+print(f'{p["id"]:<14} {p.get("engine",""):<10} {p.get("description","")}')
+PY
+  done
+}
+
+cmd_show() {
+  local f; f=$(profile_file "${1:?usage: modelctl.next show <profile>}")
+  echo "profile  : $(pfield "$f" profile.id)"
+  echo "work_dir : $("$PY" "$RENDER" "$f" --work-dir)"
+  echo "env cmd  : $("$PY" "$RENDER" "$f" --env-command)"
+  echo "log      : $(log_path "$f")"
+  echo "health   : $(health_url "$f")"
+  for k in pre stop detect kill; do
+    local items; items=$(render_list "$f" "$k")
+    [ -n "$items" ] && { echo "--- $k ---"; printf '%s\n' "$items" | sed 's/^/  /'; }
+  done
+  echo "--- env ---"; "$PY" "$RENDER" "$f" --env
+  echo "--- argv (首位=bin) ---"; load_env_layer; apply_profile_env "$f"; "$PY" "$RENDER" "$f" --argv | nl -ba
+}
+
+cmd_start() {
+  local dry=0 p=""
+  while [ $# -gt 0 ]; do case "$1" in --dry-run) dry=1 ;; *) p="$1" ;; esac; shift; done
+  p="${p:-vllm-dflash}"
+  local f; f=$(profile_file "$p")
+
+  load_env_layer
+  apply_profile_env "$f"
+  render_argv "$f"
+  local bin="${ARGV[0]}" args=("${ARGV[@]:1}")
+  local wd; wd=$("$PY" "$RENDER" "$f" --work-dir)
+  local log; log=$(log_path "$f")
+  local envcmd; envcmd=$("$PY" "$RENDER" "$f" --env-command)
+  local pre; pre=$(render_list "$f" pre)
+
+  if [ "$dry" = 1 ]; then
+    echo "=== dry-run: cwd=$wd  log=$log ==="
+    echo "--- env (profile) ---"; "$PY" "$RENDER" "$f" --env
+    echo "--- env_command ---"; echo "  ${envcmd:-（无）}"
+    [ -n "$pre" ] && { echo "--- pre ---"; printf '%s\n' "$pre" | sed 's/^/  /'; }
+    echo "--- argv (首位=bin) ---"; printf '%s\n' "$bin" "${args[@]}" | nl -ba
+    return 0
+  fi
+
+  say "stopping any running server"
+  teardown_service "$(profile_for_stop)"
+  nvidia-smi --query-gpu=index,memory.used --format=csv,noheader
+
+  # 环境准备：work_dir + environment_command，两者都可能影响 argv（相对路径、venv）
+  cd "$wd" || die "cannot cd $wd"
+  if [ -n "$envcmd" ]; then set -a; eval "$envcmd"; set +a; fi
+  render_argv "$f"
+  bin="${ARGV[0]}"; args=("${ARGV[@]:1}")
+  run_list "$f" pre "pre"
+
+  mkdir -p "$(dirname "$log")"
+  echo "$p" > "$STATE"
+  say "starting $p  (log: $log)"
+  # setsid ⇒ 新会话/新进程组，pgid == pid ⇒ 之后可以整组回收（含 TP worker）
+  setsid nohup "$bin" "${args[@]}" >"$log" 2>&1 < /dev/null &
+  echo $! > "$RUNFILE"
+  say "launched (pgid $(cat "$RUNFILE"))"
+  wait_ready "$f"
+}
+
+wait_ready() {
+  local f="$1" log i waited=0
+  log=$(log_path "$f")
+  # 冷 JIT（nvcc/cicc）能跑 5–10 分钟，所以等够 2400s；但只要没有编译器在跑，
+  # 600s 还不健康就判超时（旧 modelctl 的同一套判据）。
+  for i in $(seq 1 480); do
+    if alive "$f"; then
+      say "UP after $((i*5))s"
+      report_ready "$f"
+      return 0
+    fi
+    if ! launched_alive "$f"; then
+      say "PROCESS DIED after $((i*5))s - last errors:"
+      grep -oE 'CUDA out of memory[^)]*|ValueError[^\n]{0,160}|RuntimeError[^\n]{0,160}|OutOfMemoryError[^\n]{0,120}' "$log" 2>/dev/null | tail -3
+      return 1
+    fi
+    if pgrep -f '[c]icc|[c]c1plus|[n]vcc' >/dev/null 2>&1; then
+      waited=0
+      [ $((i % 6)) -eq 0 ] && say "JIT compiling FlashInfer kernels (nvcc/cicc active)... $((i*5))s"
+    else
+      waited=$((waited+5))
+      [ $((i % 6)) -eq 0 ] && say "still loading... $((i*5))s"
+    fi
+    if [ "$waited" -gt 600 ]; then
+      say "TIMEOUT: no compiler running and not healthy for 600s"
+      tail -5 "$log" 2>/dev/null
+      return 1
+    fi
+    sleep 5
+  done
+  say "TIMEOUT after 2400s"
+  tail -5 "$log" 2>/dev/null
+  return 1
+}
+
+# 只收「服务」，不动守护进程 —— cmd_start 内部要用的就是这一层。
+# （旧 modelctl 的 cmd_start 调的是 kill_all 而不是 cmd_stop，所以不会把自己
+#  那个 supervise 进程一起杀掉；这里必须保持同样的分层，否则守护进程每次重启
+#  服务都会先自杀。）
+teardown_service() {
+  local name="$1" pid i
+  pid=$(cat "$RUNFILE" 2>/dev/null)
+  if [ -n "$name" ]; then
+    run_list "$PROFILES/$name.json" stop "stop"
+  else
+    say "unknown profile (no $STATE, none given) -> 只回收本脚本拉起的进程组，不跑任何兜底 pkill"
+  fi
+  # 先整组温和收，再整组强收 —— pgid 覆盖 vLLM 的 TP worker 等子进程
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    kill -TERM -- "-$pid" 2>/dev/null
+    for i in $(seq 1 10); do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
+    kill -KILL -- "-$pid" 2>/dev/null
+  fi
+  rm -f "$RUNFILE"
+  [ -n "$name" ] && run_list "$PROFILES/$name.json" kill "kill"
+}
+
+cmd_stop() {
+  local dry=0 p=""
+  while [ $# -gt 0 ]; do case "$1" in --dry-run) dry=1 ;; *) p="$1" ;; esac; shift; done
+  local name; name=$(profile_for_stop "$p")
+  local pid; pid=$(cat "$RUNFILE" 2>/dev/null)
+
+  if [ "$dry" = 1 ]; then
+    echo "supervisor: $([ -f "$PIDFILE" ] && echo "pid $(cat "$PIDFILE") (会关掉)" || echo '（没有）')"
+    echo "profile   : ${name:-unknown（不会跑任何兜底 pkill）}"
+    echo "--- would run stop ---"; [ -n "$name" ] && render_list "$PROFILES/$name.json" stop | sed 's/^/  /'
+    echo "--- would group-kill pgid ---"; echo "  ${pid:-<none>}"
+    echo "--- would run kill ---"; [ -n "$name" ] && render_list "$PROFILES/$name.json" kill | sed 's/^/  /'
+    return 0
+  fi
+
+  if [ -f "$PIDFILE" ]; then kill "$(cat "$PIDFILE")" 2>/dev/null; rm -f "$PIDFILE"; say "supervisor off"; fi
+  say "stopping ${name:-unknown}"
+  teardown_service "$name"
+  say "stopped"
+}
+
+wait_vram_free() {
+  local i used
+  for i in $(seq 1 30); do
+    used=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | sort -rn | head -1)
+    [ "$used" -lt 500 ] && return 0
+    sleep 2
+  done
+  say "warn: vram still ${used} MiB after 60s"
+  return 0
+}
+
+cmd_status() {
+  local p f; p=$(current_profile)
+  if [ -z "$p" ]; then
+    echo "profile : unknown (no $STATE)"
+  else
+    f="$PROFILES/$p.json"; echo "profile : $p"
+  fi
+  if [ -n "${f:-}" ] && [ -f "$f" ] && { alive "$f" || launched_alive "$f"; }; then
+    echo "process : RUNNING"
+  elif [ -n "${f:-}" ] && [ ! -f "$f" ]; then
+    echo "process : RUNNING? (profile $p 没有对应 JSON)"
+  else
+    echo "process : not running"
+  fi
+  if [ -n "${f:-}" ] && [ -f "$f" ] && alive "$f"; then
+    echo "health  : OK ($(health_url "$f"))"
+    local mid; mid=$(first_model_id); [ -n "$mid" ] && echo "model   : $mid"
+    local kv; kv=$(kv_pool_line "$(log_path "$f")"); [ -n "$kv" ] && echo "kv pool : $kv"
+  else
+    local h="http://127.0.0.1:8080/health"; [ -n "${f:-}" ] && [ -f "$f" ] && h=$(health_url "$f")
+    echo "health  : DOWN ($h)"
+  fi
+  nvidia-smi --query-gpu=index,memory.used,utilization.gpu,temperature.gpu --format=csv,noheader | sed 's/^/gpu     : /'
+  if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+    echo "superviz: ON (pid $(cat "$PIDFILE"))"
+  else
+    echo "superviz: off"
+  fi
+}
+
+cmd_logs() {
+  local p f; p=$(current_profile)
+  if [ -z "$p" ] || [ ! -f "$PROFILES/$p.json" ]; then
+    echo "no profile in $STATE -> 不知道读哪份日志"; return 0
+  fi
+  f="$PROFILES/$p.json"
+  tail -n "${1:-40}" "$(log_path "$f")" 2>/dev/null || echo "no log at $(log_path "$f")"
+}
+
+cmd_supervise() {
+  local p="${1:-vllm-dflash}"
+  local f; f=$(profile_file "$p")
+  echo $$ > "$PIDFILE"
+  say "supervisor on for $p (pid $$)"
+  while true; do
+    if ! alive "$f"; then
+      say "health down -> clean restart of $p"
+      cmd_stop
+      wait_vram_free
+      cmd_start "$p" || say "restart attempt failed; retrying"
+    fi
+    sleep 20
+  done
+}
+
+# 面板本体是独立项目：~/gpu-model-dashboard/（dashboard.py + dashboard.sh）
+cmd_watch() { "$PY" "${MODELWATCH_PY:-$HOME/gpu-model-dashboard/dashboard.py}" "$@"; }
+
+cmd_bench() {
+  local mid; mid=$(first_model_id); mid="${mid:-Qwen3.8-27B-Q6-dual-5060ti}"
+  curl -s --max-time 600 "http://127.0.0.1:8080/v1/chat/completions" \
+    -H 'Content-Type: application/json' \
+    -d "{\"model\":\"$mid\",\"messages\":[{\"role\":\"user\",\"content\":\"say ok\"}],\"max_tokens\":8}" | head -c 300
+  echo
+}
+
+case "${1:-status}" in
+  list)      cmd_list ;;
+  show)      shift; cmd_show "$@" ;;
+  start)     shift; cmd_start "$@" ;;
+  stop)      shift; cmd_stop "$@" ;;
+  restart)   shift; cmd_stop; cmd_start "$@" ;;
+  status)    cmd_status ;;
+  logs)      shift; cmd_logs "$@" ;;
+  supervise) shift; cmd_supervise "$@" ;;
+  watch)     shift; cmd_watch "$@" ;;
+  bench)     cmd_bench ;;
+  *) sed -n '2,20p' "$0" ;;
+esac

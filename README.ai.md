@@ -251,6 +251,7 @@ Never claim a fix without a measurement. Never report a benchmark from a cold st
 | `install.sh` | idempotent installer, `DRY_RUN=1` supported |
 | `bench.sh` | full benchmark suite → `results/bench-<ts>.md` |
 | `scripts/modelctl` | lifecycle CLI (installed to `~/deploy-5060ti/modelctl`) |
+| `scripts/modelctl.next` + `scripts/profile_render.py` + `profiles/*.json` | profile-as-data runner (landed, **not** in systemd yet) — see [`docs/PROFILE-DATA.md`](docs/PROFILE-DATA.md) |
 | `scripts/vllm-merkyor-dflash-launch.sh` | production launch script; every knob is env-overridable |
 | `scripts/bench_gsq.py` | single-stream + needle recall |
 | `scripts/bench_concurrency.py` | concurrency sweep |

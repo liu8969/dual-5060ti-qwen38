@@ -1,0 +1,56 @@
+{
+  "schema": "modelctl/profile@1",
+  "_note": "原来由 modelctl 的 case 分支指向 $D/launch.sh。bin 硬编码路径改成 ${LLAMA_BIN:-...}（默认值与脚本一致，多一个覆盖口子）。",
+  "project": {
+    "id": "deploy-5060ti",
+    "name": "deploy-5060ti",
+    "work_dir": "/home/lcy/deploy-5060ti",
+    "environment_command": ". $HOME/.modelctl.env"
+  },
+  "profile": {
+    "id": "llama168",
+    "name": "llama168",
+    "engine": "llama.cpp",
+    "description": "llama.cpp UD-Q6_K + MTP2，q8_0 KV，172032 ctx，4 槽统一池（--kv-unified）",
+    "bin": "${LLAMA_BIN:-/home/lcy/llama.cpp/build/bin/llama}",
+    "env": {
+      "CUDA_VISIBLE_DEVICES": "0,1"
+    },
+    "args": [
+      "serve",
+      "--model", "${MODEL:-${MODELS:-/home/lcy/Models}/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q6_K.gguf}",
+      "--alias", "Qwen3.8-27B-Q6-dual-5060ti",
+      "--ctx-size", "${CTX:-172032}",
+      "--n-gpu-layers", "99",
+      "--cache-type-k", "${KVT:-q8_0}",
+      "--cache-type-v", "${KVT:-q8_0}",
+      "--split-mode", "${SPLIT:-tensor}",
+      "--tensor-split", "${TSPLIT:-50,50}",
+      "--temp", "1.0",
+      "--top-k", "20",
+      "--top-p", "0.95",
+      "--min-p", "0",
+      "--presence-penalty", "0.0",
+      "--repeat-penalty", "1.0",
+      "--batch-size", "2048",
+      "--ubatch-size", "512",
+      "--jinja",
+      "--parallel", "4",
+      "--kv-unified",
+      "--spec-type", "draft-mtp",
+      "--spec-draft-p-min", "0.1",
+      "--spec-draft-n-max", "2",
+      "--reasoning", "on",
+      "--reasoning-budget", "8192",
+      "--host", "0.0.0.0",
+      "--port", "${PORT:-8080}"
+    ],
+    "health": "http://127.0.0.1:8080/health",
+    "metrics": "http://127.0.0.1:8080/metrics",
+    "kill": [
+      "pkill -9 -x llama"
+    ],
+    "log": "$HOME/modelctl-logs/llama168.log",
+    "startup_budget_s": [20, 120]
+  }
+}

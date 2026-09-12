@@ -1,0 +1,70 @@
+{
+  "schema": "modelctl/profile@1",
+  "_note": "字段名与 SSH Manager 的 launch project 对齐（project.work_dir / project.environment_command / profile.launch_command），modelctl 不再内置任何引擎知识。profile.args 里 ${VAR:-default} 由调用方的环境覆盖（~/.modelctl.env 就是那层覆盖，实验通道不变）。",
+  "project": {
+    "id": "deploy-5060ti",
+    "name": "deploy-5060ti",
+    "work_dir": "/home/lcy/deploy-5060ti",
+    "environment_command": ". $HOME/.modelctl.env"
+  },
+  "profile": {
+    "id": "vllm-dflash",
+    "name": "vllm-dflash",
+    "engine": "vllm",
+    "description": "生产档：Merkyor W4A4 NVFP4 + DFlash2 K=10 + FP8 KV + FLASHINFER，150K",
+    "bin": "${VLLM_BIN:-$HOME/vllm-current/bin/vllm}",
+    "env": {
+      "CUDA_HOME": "/usr/local/cuda",
+      "LD_LIBRARY_PATH": "/usr/local/cuda/lib64",
+      "PATH": "/usr/local/cuda-13.3/bin:$PATH",
+      "HF_ENDPOINT": "https://hf-mirror.com",
+      "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+      "VLLM_ALLOW_LONG_MAX_MODEL_LEN": "1",
+      "VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE": "16777216",
+      "MAX_JOBS": "2"
+    },
+    "args": [
+      "serve",
+      "${MODELS:-/home/lcy/Models}/Merkyor-W4A4/NVFP4/W4A4",
+      "--served-model-name", "Qwen3.8-27B-Q6-dual-5060ti",
+      "--host", "0.0.0.0",
+      "--port", "8080",
+      "--tensor-parallel-size", "2",
+      "--dtype", "bfloat16",
+      "--kv-cache-dtype", "fp8",
+      "--attention-backend", "${ATTN:-TRITON_ATTN}",
+      "--mamba-cache-dtype", "bfloat16",
+      "--mamba-ssm-cache-dtype", "bfloat16",
+      "--gpu-memory-utilization", "${UTIL:-0.977}",
+      "--kv-cache-memory", "${KVBYTES:-3865470566}",
+      { "when": "SPEC_METRICS", "args": ["--per-request-spec-decode-metrics", "${SPEC_METRICS:-none}"] },
+      { "when": "SCHED_TOKENS", "args": ["--max-num-scheduled-tokens", "${SCHED_TOKENS}"] },
+      { "when": "KV_METRICS==1", "args": ["--kv-cache-metrics"] },
+      { "when": "MFU_METRICS==1", "args": ["--enable-mfu-metrics"] },
+      { "when": "CG_METRICS==1", "args": ["--cudagraph-metrics"] },
+      { "when": "QUEUED_REQS", "args": ["--max-num-queued-reqs", "${QUEUED_REQS}"] },
+      "--max-model-len", "${MAXLEN:-150000}",
+      "--max-num-seqs", "${SEQ:-4}",
+      "--max-num-batched-tokens", "${MAXNUM:-1024}",
+      "--enable-chunked-prefill",
+      "--speculative-config", "{\"model\":\"${MODELS:-/home/lcy/Models}/Merkyor-W4A4/NVFP4/W4A4/DFlash2-FP8\",\"method\":\"dflash\",\"num_speculative_tokens\":${K:-10},\"quantization\":\"compressed-tensors\",\"draft_tensor_parallel_size\":2}",
+      "--no-enable-flashinfer-autotune",
+      "--enable-prefix-caching",
+      "--enable-prompt-tokens-details",
+      "--disable-custom-all-reduce",
+      "--language-model-only",
+      "--enable-auto-tool-choice",
+      "--tool-call-parser", "qwen3_xml",
+      "--reasoning-parser", "qwen3",
+      "--generation-config", "vllm"
+    ],
+    "health": "http://127.0.0.1:8080/health",
+    "metrics": "http://127.0.0.1:8080/metrics",
+    "kill": [
+      "pkill -9 -f 'vllm serve'",
+      "pkill -9 -f 'EngineCore'"
+    ],
+    "log": "$HOME/modelctl-logs/vllm-dflash.log",
+    "startup_budget_s": [66, 200]
+  }
+}
