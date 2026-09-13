@@ -57,7 +57,7 @@ vLLM 0.29.0
 | `--kv-cache-memory` | `3865470566` | Pins the pool base; the realised pool depends on the draft-token slots: **157,824** at K=10, 170,280 at K=5, 172,480 with prefix caching off. Tuning `--gpu-memory-utilization` instead gives a smaller, jittery pool. This is the single most important knob. |
 | `--gpu-memory-utilization` | `0.977` | 0.985 and 0.99 both fail with `Engine core init failed`. 0.977 + pinned KV is the stable combination. |
 | `--max-num-batched-tokens` | `1024` | At 4096 the KV pool collapses from 4.3 GiB to 2.92 GiB and 150K raises `ValueError` (max 137,376). Do not raise it. |
-| `--max-num-seqs` | `4` | Measured optimum: C=4 → 255.5 tok/s aggregate at ~66 tok/s per stream. C=8 adds only 3.6% and queues half the requests. C=4 with `max-num-seqs 3` queues the 4th request and drops to 156 tok/s. |
+- Reference values (production, FLASHINFER + DFlash2 K=10, thinking off): single stream **162** tok/s off / **87** on; C=4 aggregate **249.9** tok/s (C=6 掉到 193.8); KV pool **157,824**. 深度与任务形态相关的解码表见 [`docs/TEST-MATRIX.md`](docs/TEST-MATRIX.md) §8.6，优化方向与已关闭的门见 [`docs/INFERENCE-OPTIMIZATION.md`](docs/INFERENCE-OPTIMIZATION.md)
 | `--kv-cache-dtype` | `fp8` | 16 KB/token/card. SGLang's fp8 path costs ~20.2 KB — vLLM's cheaper KV is what makes the 172K pool possible. |
 | DFlash2 draft | 5 tokens | Accept length 3.46–4.77, acceptance 49–75%. MTP3 gives a bigger pool (247,150) but decodes at 73.2/58.3 tok/s — DFlash2 wins for interactive use. |
 | `--attention-backend` | `TRITON_ATTN` | Most stable on sm_120. |
