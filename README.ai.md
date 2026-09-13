@@ -57,10 +57,10 @@ vLLM 0.29.0
 | `--kv-cache-memory` | `3865470566` | Pins the pool base; the realised pool depends on the draft-token slots: **157,824** at K=10, 170,280 at K=5, 172,480 with prefix caching off. Tuning `--gpu-memory-utilization` instead gives a smaller, jittery pool. This is the single most important knob. |
 | `--gpu-memory-utilization` | `0.977` | 0.985 and 0.99 both fail with `Engine core init failed`. 0.977 + pinned KV is the stable combination. |
 | `--max-num-batched-tokens` | `1024` | At 4096 the KV pool collapses from 4.3 GiB to 2.92 GiB and 150K raises `ValueError` (max 137,376). Do not raise it. |
-- Reference values (production, FLASHINFER + DFlash2 K=10, thinking off): single stream **162** tok/s off / **87** on; C=4 aggregate **249.9** tok/s (C=6 掉到 193.8); KV pool **157,824**. 深度与任务形态相关的解码表见 [`docs/TEST-MATRIX.md`](docs/TEST-MATRIX.md) §8.6，优化方向与已关闭的门见 [`docs/INFERENCE-OPTIMIZATION.md`](docs/INFERENCE-OPTIMIZATION.md)
+| `--max-num-seqs` | `4` | Measured optimum: C=4 → 249.9 tok/s aggregate (~62 tok/s per stream). C=6 掉到 193.8、C=8 243.1 —— 超过 4 条不会更快（KV 池放不下，多余请求排队）。 |
 | `--kv-cache-dtype` | `fp8` | 16 KB/token/card. SGLang's fp8 path costs ~20.2 KB — vLLM's cheaper KV is what makes the 172K pool possible. |
 | DFlash2 draft | 5 tokens | Accept length 3.46–4.77, acceptance 49–75%. MTP3 gives a bigger pool (247,150) but decodes at 73.2/58.3 tok/s — DFlash2 wins for interactive use. |
-| `--attention-backend` | `TRITON_ATTN` | Most stable on sm_120. |
+| `--attention-backend` | `FLASHINFER` | 2026-09-12 切换（预填 +28%、长上下文解码 ×2.03，输出逐字不变）。TRITON_ATTN 为历史档。 |
 | `MAX_JOBS` | `2` | Each nvcc TU uses 2.5–3 GB RSS; 18 parallel nvcc OOM-kills a 32 GB host. |
 | `--enable-prefix-caching` | **on** | Costs 2,200 tokens of pool (172,480 → 170,280) but cuts TTFT on a repeated long prompt from 11.9 s to 0.7 s at 30K and from 49.5 s to 1.2 s at 90K (16.9× / 40.2×). Verify with `scripts/prefix_cache_test.py`. Was disabled during the first stability pass; seely with a benchmark before/after. |
 
@@ -218,8 +218,8 @@ in size (5,336,880 vs 5,316,288) — there is **no throughput penalty** for usin
   `max_tokens=256` with a Chinese prompt. **Never compare numbers across the two scripts.**
 - The first request after startup is 10–20% slower (cudagraph/autotune warm-up). Run the
   single-stream test twice and report the second run.
-- Reference values (production profile): single stream 115.7 tok/s off / 79.1 on; C=4 255.5 tok/s
-  aggregate; 100K prefill ~1,396 tok/s; 100K needle recall 5/5.
+- Reference values (production, FLASHINFER + DFlash2 K=10, thinking off): single stream **162** tok/s off / **87** on; C=4 aggregate **249.9** tok/s; KV pool **157,824**.
+  深度与任务形态相关的解码表见 [`docs/TEST-MATRIX.md`](docs/TEST-MATRIX.md) §8.6；优化方向与已关闭的门见 [`docs/INFERENCE-OPTIMIZATION.md`](docs/INFERENCE-OPTIMIZATION.md)。
 - Anything more than ~5% below these on a warm run is a regression worth investigating.
 
 ## 8. Change protocol
