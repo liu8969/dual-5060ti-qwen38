@@ -223,6 +223,87 @@ def test_shipped_profiles_serve_the_canonical_id():
 
 
 @case
+def test_vllm_dflash_experiment_channel_is_off_by_default():
+    """The A/B channel in `vllm-dflash.json` must not fire on a clean environment.
+
+    Every knob there is an opt-in `{"when": VAR}` or an empty `${SPEC_EXTRA}`; if one
+    of them leaked into the default render, production would silently change shape.
+    """
+    doc = json.loads((PROFILES / "vllm-dflash.json").read_text(encoding="utf-8"))
+    _, argv = R.render(doc, {"HOME": "/home/lcy", "MODELS": "/home/lcy/Models"})
+
+    eq(argv[argv.index("--speculative-config") + 1],
+       '{"model":"/home/lcy/Models/Merkyor-W4A4/NVFP4/W4A4/DFlash2-FP8","method":"dflash",'
+       '"num_speculative_tokens":10,"quantization":"compressed-tensors","draft_tensor_parallel_size":2}',
+       "default speculative-config must equal today's production string")
+
+    for flag in ("--async-scheduling", "--kv-sharing-fast-prefill", "--kv-offloading-size",
+                 "--scheduling-policy", "--watermark", "--stream-interval",
+                 "--long-prefill-token-threshold", "--disable-hybrid-kv-cache-manager",
+                 "--kv-cache-dtype-skip-layers"):
+        assert flag not in argv, f"{flag} leaked into the default render"
+
+
+@case
+def test_vllm_dflash_experiment_channel_engages():
+    """With the knobs exported, the flags appear and the spec config stays valid JSON."""
+    doc = json.loads((PROFILES / "vllm-dflash.json").read_text(encoding="utf-8"))
+    env = {
+        "HOME": "/home/lcy", "MODELS": "/home/lcy/Models",
+        "ASYNC": "1", "KVSHARE": "1", "K": "6", "DRAFT_TP": "1",
+        "SPEC_EXTRA": ',"enable_adaptive_verification":true',
+    }
+    _, argv = R.render(doc, env)
+    assert "--async-scheduling" in argv
+    assert "--kv-sharing-fast-prefill" in argv
+    spec = json.loads(argv[argv.index("--speculative-config") + 1])
+    eq(spec["num_speculative_tokens"], 6, "K override")
+    eq(spec["draft_tensor_parallel_size"], 1, "draft TP override")
+    eq(spec["enable_adaptive_verification"], True, "extra key spliced in")
+
+
+@case
+def test_vllm_dflash_port_is_data():
+    """Isolated A/B needs a second port, so the endpoint moves with `VLLM_PORT`.
+
+    Guard both directions: the default must stay 8080 (production parity), and the
+    override must move the port, the health URL and the metrics URL together —
+    a health URL left on 8080 would make the runner wait forever for a service
+    that is listening on 8081.
+    """
+    doc = json.loads((PROFILES / "vllm-dflash.json").read_text(encoding="utf-8"))
+    base_env = {"HOME": "/home/lcy", "MODELS": "/home/lcy/Models"}
+
+    _, argv = R.render(doc, dict(base_env))
+    eq(argv[argv.index("--port") + 1], "8080", "default port")
+    eq(R.expand(doc["profile"]["health"], dict(base_env)),
+       "http://127.0.0.1:8080/health", "default health")
+
+    env = dict(base_env, VLLM_PORT="8081")
+    _, argv = R.render(doc, env)
+    eq(argv[argv.index("--port") + 1], "8081", "overridden port")
+    eq(R.expand(doc["profile"]["health"], env),
+       "http://127.0.0.1:8081/health", "health follows the port")
+    eq(R.expand(doc["profile"]["metrics"], env),
+       "http://127.0.0.1:8081/metrics", "metrics follows the port")
+
+
+@case
+def test_env_layer_is_not_applied_by_environment_command():
+    """The runner applies `~/.modelctl.env` itself, with caller-priority semantics.
+
+    A profile that ALSO sources it as `environment_command` applies the layer a second
+    time through a real `source`, which clobbers whatever the caller exported — that is
+    how a whole K sweep silently ran at K=10 in every arm. `environment_command` is for
+    one-off setup (a venv activate, say), never for the experiment layer.
+    """
+    for path in shipped():
+        doc = json.loads(path.read_text(encoding="utf-8"))
+        cmd = str(doc.get("project", {}).get("environment_command", ""))
+        assert ".modelctl.env" not in cmd, f"{path.name}: environment_command sources the层 again"
+
+
+@case
 def test_shipped_profiles_log_is_absolute():
     """`--log` feeds `mkdir -p $(dirname ...)` and the redirect target."""
     for path in shipped():

@@ -5,7 +5,7 @@
     "id": "deploy-5060ti",
     "name": "deploy-5060ti",
     "work_dir": "/home/lcy/deploy-5060ti",
-    "environment_command": ". $HOME/.modelctl.env"
+    "environment_command": ""
   },
   "profile": {
     "id": "llama168",

@@ -104,6 +104,7 @@ def main() -> int:
     ap.add_argument("--work-dir", action="store_true")
     ap.add_argument("--env-command", action="store_true")
     ap.add_argument("--log", action="store_true")
+    ap.add_argument("--health", action="store_true")
     ap.add_argument("--pre-nul", action="store_true")
     ap.add_argument("--stop-nul", action="store_true")
     ap.add_argument("--detect-nul", action="store_true")
@@ -136,6 +137,10 @@ def main() -> int:
 
     if args.log:
         print(expand(str(doc["profile"].get("log", "")), env))
+        return 0
+
+    if args.health:
+        print(expand(str(doc["profile"].get("health", "")), env))
         return 0
 
     list_out = {"pre": args.pre_nul, "stop": args.stop_nul,

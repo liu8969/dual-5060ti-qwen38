@@ -5,7 +5,7 @@
     "id": "deploy-5060ti",
     "name": "deploy-5060ti",
     "work_dir": "/home/lcy/deploy-5060ti",
-    "environment_command": ". $HOME/.modelctl.env"
+    "environment_command": ""
   },
   "profile": {
     "id": "vllm-dflash",
@@ -28,7 +28,7 @@
       "${MODELS:-/home/lcy/Models}/Merkyor-W4A4/NVFP4/W4A4",
       "--served-model-name", "Qwen3.8-27B-Q6-dual-5060ti",
       "--host", "0.0.0.0",
-      "--port", "8080",
+      "--port", "${VLLM_PORT:-8080}",
       "--tensor-parallel-size", "2",
       "--dtype", "bfloat16",
       "--kv-cache-dtype", "fp8",
@@ -47,7 +47,16 @@
       "--max-num-seqs", "${SEQ:-4}",
       "--max-num-batched-tokens", "${MAXNUM:-1024}",
       "--enable-chunked-prefill",
-      "--speculative-config", "{\"model\":\"${MODELS:-/home/lcy/Models}/Merkyor-W4A4/NVFP4/W4A4/DFlash2-FP8\",\"method\":\"dflash\",\"num_speculative_tokens\":${K:-10},\"quantization\":\"compressed-tensors\",\"draft_tensor_parallel_size\":2}",
+      { "when": "ASYNC", "args": ["--async-scheduling"] },
+      { "when": "KVSHARE", "args": ["--kv-sharing-fast-prefill"] },
+      { "when": "KVOFFLOAD", "args": ["--kv-offloading-size", "${KVOFFLOAD}"] },
+      { "when": "SCHEDPOLICY", "args": ["--scheduling-policy", "${SCHEDPOLICY}"] },
+      { "when": "WATERMARK", "args": ["--watermark", "${WATERMARK}"] },
+      { "when": "STREAMINT", "args": ["--stream-interval", "${STREAMINT}"] },
+      { "when": "LONGPREFILL", "args": ["--long-prefill-token-threshold", "${LONGPREFILL}"] },
+      { "when": "NOHYBRID", "args": ["--disable-hybrid-kv-cache-manager"] },
+      { "when": "SKIPKVQ", "args": ["--kv-cache-dtype-skip-layers", "${SKIPKVQ}"] },
+      "--speculative-config", "{\"model\":\"${MODELS:-/home/lcy/Models}/Merkyor-W4A4/NVFP4/W4A4/DFlash2-FP8\",\"method\":\"dflash\",\"num_speculative_tokens\":${K:-10},\"quantization\":\"compressed-tensors\",\"draft_tensor_parallel_size\":${DRAFT_TP:-2}${SPEC_EXTRA}}",
       "--no-enable-flashinfer-autotune",
       "--enable-prefix-caching",
       "--enable-prompt-tokens-details",
@@ -58,8 +67,8 @@
       "--reasoning-parser", "qwen3",
       "--generation-config", "vllm"
     ],
-    "health": "http://127.0.0.1:8080/health",
-    "metrics": "http://127.0.0.1:8080/metrics",
+    "health": "http://127.0.0.1:${VLLM_PORT:-8080}/health",
+    "metrics": "http://127.0.0.1:${VLLM_PORT:-8080}/metrics",
     "kill": [
       "pkill -9 -f 'vllm serve'",
       "pkill -9 -f 'EngineCore'"

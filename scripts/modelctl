@@ -70,9 +70,31 @@ print("" if cur is None else cur)
 PY
 }
 
-# 覆盖层：~/.modelctl.env 里的变量必须导出（set -a），否则渲染器看不到
-# —— 这是 A/B 实验通道（K、ATTN、MAXNUM…），行为与旧 modelctl 一致。
-load_env_layer() { if [ -f "$ENV_LAYER" ]; then set -a; . "$ENV_LAYER"; set +a; fi; }
+# 覆盖层：~/.modelctl.env 是 A/B 实验通道（K、ATTN、MAXNUM…）。
+#
+# 关键语义：**调用方已经导出的变量优先**。早先这里是 `set -a; . "$ENV_LAYER"`，
+# 结果文件里的 `K=10` 会把命令行上的 `K=6` 覆盖掉 —— 一次 K 曲线扫描四个档全跑成
+# K=10，而"每档 draft_per_step 都是 10.0"这种证据只有事后翻日志才看得出来。
+# 现在改成逐行赋值、只设未设过的键，于是 `K=6 bash modelctl start vllm-dflash`
+# 才真的能换档。
+#
+# 代价：这里不再是真的 `source`，所以该文件只能是**纯 KEY=VALUE 赋值**（不能写
+# 命令替换、条件、引用其它变量）。当前文件满足这一点。
+load_env_layer() {
+  [ -f "$ENV_LAYER" ] || return 0
+  local line key val
+  while IFS= read -r line; do
+    case "$line" in ''|'#'*) continue ;; esac
+    line=${line#export }
+    case "$line" in *=*) ;; *) continue ;; esac
+    key=${line%%=*}
+    val=${line#*=}
+    key=${key// /}
+    [ -n "$key" ] || continue
+    [ -n "${!key+x}" ] && continue          # 调用方已设置 -> 以调用方为准
+    export "$key=$val"
+  done < "$ENV_LAYER"
+}
 
 apply_profile_env() {
   local line
@@ -99,7 +121,9 @@ run_list() { # run_list <file> <key> <label> —— 逐条 eval，失败只告�
 }
 
 log_path() { "$PY" "$RENDER" "$1" --log; }
-health_url() { pfield "$1" "profile.health" "http://127.0.0.1:8080/health"; }
+health_url() { "$PY" "$RENDER" "$1" --health; }
+# API 起点 = 健康地址去掉 /health。端口来自 profile（隔离测试时用 VLLM_PORT 换口）。
+api_base() { local h; h=$(health_url "$1"); printf '%s' "${h%/health}"; }
 
 alive() { curl -s --max-time 3 "$(health_url "$1")" >/dev/null 2>&1; }
 
@@ -116,7 +140,7 @@ launched_alive() {
 }
 
 first_model_id() {
-  curl -s --max-time 5 "http://127.0.0.1:8080/v1/models" \
+  curl -s --max-time 5 "$(api_base "$1")/v1/models" \
     | "$PY" -c 'import json,sys; d=json.load(sys.stdin)["data"]; print(d[0]["id"] if d else "")' 2>/dev/null
 }
 
@@ -127,7 +151,7 @@ kv_pool_line() {
 report_ready() { # start 之后必须报的三个数字：health + KV 池 + 每卡显存
   local f="$1" log; log=$(log_path "$f")
   echo "health  : OK ($(health_url "$f"))"
-  local mid; mid=$(first_model_id); [ -n "$mid" ] && echo "model   : $mid"
+  local mid; mid=$(first_model_id "$f"); [ -n "$mid" ] && echo "model   : $mid"
   local kv; kv=$(kv_pool_line "$log"); [ -n "$kv" ] && echo "kv pool : $kv"
   nvidia-smi --query-gpu=index,memory.used,utilization.gpu,temperature.gpu --format=csv,noheader | sed 's/^/gpu     : /'
 }
@@ -315,7 +339,7 @@ cmd_status() {
   fi
   if [ -n "${f:-}" ] && [ -f "$f" ] && alive "$f"; then
     echo "health  : OK ($(health_url "$f"))"
-    local mid; mid=$(first_model_id); [ -n "$mid" ] && echo "model   : $mid"
+    local mid; mid=$(first_model_id "$f"); [ -n "$mid" ] && echo "model   : $mid"
     local kv; kv=$(kv_pool_line "$(log_path "$f")"); [ -n "$kv" ] && echo "kv pool : $kv"
   else
     local h="http://127.0.0.1:8080/health"; [ -n "${f:-}" ] && [ -f "$f" ] && h=$(health_url "$f")
@@ -363,8 +387,10 @@ cmd_bench() {
     python3 "$D/bench_gsq.py" 2>&1 | head -3
     return 0
   fi
-  local mid; mid=$(first_model_id); mid="${mid:-Qwen3.8-27B-Q6-dual-5060ti}"
-  curl -s --max-time 600 "http://127.0.0.1:8080/v1/chat/completions" \
+  local f="$PROFILES/$(current_profile).json" base="http://127.0.0.1:8080"
+  [ -f "$f" ] && base=$(api_base "$f")
+  local mid; mid=$(first_model_id "$f"); mid="${mid:-Qwen3.8-27B-Q6-dual-5060ti}"
+  curl -s --max-time 600 "$base/v1/chat/completions" \
     -H 'Content-Type: application/json' \
     -d "{\"model\":\"$mid\",\"messages\":[{\"role\":\"user\",\"content\":\"say ok\"}],\"max_tokens\":8}" | head -c 300
   echo
