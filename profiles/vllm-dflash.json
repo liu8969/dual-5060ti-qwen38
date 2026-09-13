@@ -50,6 +50,7 @@
       { "when": "ASYNC", "args": ["--async-scheduling"] },
       { "when": "KVSHARE", "args": ["--kv-sharing-fast-prefill"] },
       { "when": "KVOFFLOAD", "args": ["--kv-offloading-size", "${KVOFFLOAD}"] },
+      { "when": "CUMEM", "args": ["--enable-cumem-allocator"] },
       { "when": "SCHEDPOLICY", "args": ["--scheduling-policy", "${SCHEDPOLICY}"] },
       { "when": "WATERMARK", "args": ["--watermark", "${WATERMARK}"] },
       { "when": "STREAMINT", "args": ["--stream-interval", "${STREAMINT}"] },
