@@ -1,7 +1,7 @@
 # Profiles as data — `profiles/*.json` + one generic runner
 
 **Status: phase 1 landed, production still runs `scripts/modelctl`.**
-`modelctl.next` renders byte-identical argv to the live process (see §Verification) but is
+`scripts/modelctl（运行器）` renders byte-identical argv to the live process (see §Verification) but is
 *not* wired into systemd yet.
 
 ## Why
@@ -53,7 +53,7 @@ into that UI later.
 
 ## Rendering vs running
 
-`scripts/profile_render.py` only turns JSON into text; `scripts/modelctl.next` is the lifecycle
+`scripts/profile_render.py` only turns JSON into text; `scripts/scripts/modelctl（运行器）` is the lifecycle
 driver (`list | show <p> | start <p> [--dry-run] | stop [p] [--dry-run] | restart | status |
 logs | supervise | watch | bench`).
 
@@ -65,8 +65,29 @@ python3 profile_render.py profiles/vllm-dflash.json --pre-nul   # also --stop-nu
 python3 profile_render.py profiles/vllm-dflash.json --log --work-dir --env-command
 ```
 
-`modelctl.next start <p> --dry-run` prints cwd, env, `environment_command`, `pre` and the full
+`scripts/modelctl（运行器） start <p> --dry-run` prints cwd, env, `environment_command`, `pre` and the full
 argv without starting anything. **Always dry-run a new profile first.**
+
+## 实验通道（A/B）：改配置不用改脚本
+
+`profiles/vllm-dflash.json` 里预置了条件参数，**默认全部关闭**（有单测 `test_vllm_dflash_experiment_channel_is_off_by_default` 守着，
+所以生产档不会静默变形状）。用环境变量打开即换档，**调用方的 env 优先于 `~/.modelctl.env`**：
+
+| 变量 | 作用 |
+|---|---|
+| `VLLM_PORT` | `--port`，健康/接口地址一起跟着走 → **隔离测量就靠它**（变体跑 8081，别的会话打不进来） |
+| `K` / `DRAFT_TP` / `SPEC_EXTRA` | 写进 `--speculative-config`（`SPEC_EXTRA` 追加键，如 `,"enable_adaptive_verification":true`） |
+| `ASYNC` / `MAXNUM` / `SEQ` / `UTIL` / `KVBYTES` | 调度与显存参数 |
+| `KVOFFLOAD` + `CUMEM=1` | CPU KV 卸载 —— **必须配 `--enable-cumem-allocator`**（生产设了 `expandable_segments:True`），且 `/dev/shm` 上限 ~15 GiB |
+| `KVSHARE` / `SCHEDPOLICY` / `WATERMARK` / `STREAMINT` / `LONGPREFILL` / `SKIPKVQ` / `NOHYBRID` | 其余开关 |
+
+```bash
+VLLM_PORT=8081 K=6 bash ~/deploy-5060ti/modelctl.new start vllm-dflash
+```
+
+两条踩过的坑写进实现里了：**实验层只能由 runner 应用一次**（`project.environment_command` 不得再 `source` 它，
+否则把调用方的覆盖盖掉 —— 曾让整条 K 曲线都跑在 K=10）；**每档起完要回读 `/proc/<pid>/cmdline` 核对旋钮**，
+不一致就作废该档，而不是照跑。
 
 ## Two safety rules that came out of real incidents
 
@@ -100,7 +121,7 @@ survive a plain `kill -9` of the API server and keep ~15.7 GB/card. The pgid is 
 `/proc/<pid>/cmdline` and environ (`/tmp/parity/live.argv`, `/tmp/parity/live.env`):
 
 * renderer path — `✓ bin 一致` + `✓ argv 逐字一致（54 项）` + 7/7 env keys identical;
-* runner path (`modelctl.next start vllm-dflash --dry-run`) — aligned `bin + argv` 55/55
+* runner path (`scripts/modelctl（运行器） start vllm-dflash --dry-run`) — aligned `bin + argv` 55/55
   byte-identical (`/proc` shows the console script's interpreter first, so the comparison drops
   `live[0]`).
 
