@@ -17,7 +17,7 @@
 | 预填随深度 | 8K→3,511 · 32K→2,783 · 64K→2,176 · 96K→1,784 · 128K→1,532 tok/s | 平滑下降；TTFT 2.5→84s。**预填是绝对成本** |
 | 预填 vs 内容 | 同深度合成填充 1,806.8 vs 真实代码 1,786.2（差 1.2%） | **预填与内容无关** → 只能靠"少算"或"算得更快" |
 | nsys（97K 预填） | attention 占 60%+；TP=2 all-reduce 16.5%（29,960 次 NCCL）；NVFP4 GEMM 14.2%；GDN **1.0%** | 大头是 attention；GDN 与结构通信都不值得动 |
-| 解码的构成 | tok/s = tok/step × steps/s。steps/s 只随深度 26.5→20.5；**tok/step 实现类 10.31 vs 写补丁 4.6–6.7** | **解码的杠杆在接受率**，且它是任务形态的函数 |
+| 解码的构成 | tok/s = tok/step × steps/s。steps/s 只随深度 26.5→20.5；**tok/step 实现类 10.31 vs 写补丁 4.6–6.7**（**thinking-off 档**，生产是开思考 → §8） | **解码的杠杆在接受率**，且它是任务形态的函数 |
 | 解码功耗 | 75 W / 180 W | **访存延迟受限**，不是算力受限 → 提高算力/内核效率意义有限 |
 | 前缀缓存 | TTFT 30K 档 11.9s→0.7s（16.9×）、90K 档 49.5s→1.2s（40.2×） | 这是**本项目最大的单点收益**，且还没调过参数 |
 
@@ -38,7 +38,7 @@
 
 ### 3.1 难任务的接受率：prompt-lookup / suffix decoding ← 最高杠杆
 
-现在最差的一档正是最重要的真实场景：**写 unified diff / patch 时 tok/step 只有 4.6–6.7**，而"实现给定函数"能到 10.31。
+现在最差的一档正是最重要的真实场景：**写 unified diff / patch 时 tok/step 只有 4.6–6.7**，而"实现给定函数"能到 10.31（**两者都是 thinking-off 档**；生产开思考时接受率还要腰斩，见 §8 —— 这会让本节的上限估算改变，先按 §8 修正再定力气）。
 补丁类内容的特征是**大量 token 直接从上下文抄**（路径、标识符、既有代码块），而这正是
 **检索式投机器**（vLLM 0.29 `SpeculativeConfig` 的 `prompt_lookup_min/max`、
 `suffix_decoding_max_tree_depth`、`suffix_decoding_max_spec_factor`）的主场。
@@ -99,4 +99,47 @@ K 已在甜点、draft_tp 无收益 → 只剩"草稿本身更强"这条路。�
 - §8.6（FLASHINFER + K=10）是**现行基线**；
 - §8.1b（K=10 但仍 TRITON_ATTN）8K→149.9…128K→57.9，属历史档；
 - 更早的「23K→68.6 … 92K→33.5」是 **DFlash2 之前**的数据。
-三者相差 2–3 倍，**引用时必须带上下文长度与任务形态**，否则结论会反过来。
+三者相差 2–3 倍，**引用时必须带上下文长度、任务形态，以及思考开关**，否则结论会反过来。
+
+## 8. 思考开关是第三个必带标签（2026-09-14 补测）
+
+**问题**：本文 §1 的解码数字（tok/step 实现类 10.31 / 写补丁 4.6–6.7）来自盒子侧 harness，
+而该 harness **硬编码关思考**；生产却是**开思考**。两者不是同一档，直接引用会把结论判错。
+
+**证据链（三条，都可复核）**
+
+1. **harness 关思考（源码）**：`~/codebench/measure_spec.py:280` 与 `code_ctx_sweep.py:168`
+   都是 `"chat_template_kwargs": {"enable_thinking": False}` —— §1 那两行数字全是 thinking-off 档。
+2. **生产开思考（配置 + 实测）**：`~/.dsh/settings.yaml` 的 `qwen-local` 既无 `reasoning`
+   也无 `chatTemplateKwargs` → pi-ai 不发思考参数 → 走模板默认。直接问引擎核对：同一提问
+   **不传参数**时 `completion_tokens_details.reasoning_tokens = 53`，
+   **显式 `enable_thinking:false`** 时为 `0`。
+3. **代价实测**（8K、真语料 zxbench、`task=code`、C=1、max_tokens 2048、生产端点 8080、
+   `K=10` + FLASHINFER，2026-09-14；两次 `prefix_hits=0`、`preemptions=0` → 无前缀缓存与队列污染）：
+
+   | 档 | 预填 tok/s | TTFT | 解码 tok/s | steps | acc/step | accept/token |
+   |---|---|---|---|---|---|---|
+   | thinking off | 3,479.6 | 2.823 s | 145.6 | 372 | 4.503 | 45.0% |
+   | **thinking on（= 生产）** | 3,496.7 | 2.821 s | **91.3** | 593 | **2.452** | **24.5%** |
+
+**结论**
+
+- **预填与思考开关无关**（+0.5%，与 §1「预填与内容无关」一致）；**代价全在解码**：
+  接受率 −46%、解码 tok/s −37%，因为开思考的步数多 59% 而每步只多接受 2.45 个草稿 token。
+- 独立复现了 `model-bench` 的表（真语料 4.97 → 2.41、accept/token 46–50% → 23–26%），差在噪声内。
+- **对 §3 排序的影响**：生产档的一个解码步只产出 `1 + 2.452 = 3.45` 个 token，
+  而 K=10 的设计点（`TEST-MATRIX` §8.6 短提示高可预测代码）是 `1 + 9.63`。**投机解码在生产档远远没吃满**，
+  这与 §3.1「难任务的接受率是最高杠杆」方向一致，但**上限要按 3.45 这个真实起点重算**，
+  不能沿用 10.31。尤其注意：**prompt-lookup / suffix 靠"从上下文抄"**，
+  而开思考产出的**思考段是全新文本、无可抄** —— 它只可能对补丁/引用类正文有效，
+  对思考段无效，所以收益要乘上"正文占比"。
+- **待办**：本文 §3.1 与 §3.3 的取舍，应在**开思考**下跑「任务形态 × tok/step」矩阵后再定
+  （§4 那一测）。
+
+**复现命令**（读数落在 `results/matrix/`，已 gitignore）：
+
+```bash
+node bin/bench-run.mjs --endpoint http://192.168.0.119:8080 \
+  --corpus ~/Documents/ubuntu/zxbench --task code --depth 8192 \
+  --max-tokens 2048 --concurrency 1 --thinking on --label 8k-code-thon --out results/matrix
+```
