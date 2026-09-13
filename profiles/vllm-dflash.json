@@ -57,7 +57,7 @@
       { "when": "LONGPREFILL", "args": ["--long-prefill-token-threshold", "${LONGPREFILL}"] },
       { "when": "NOHYBRID", "args": ["--disable-hybrid-kv-cache-manager"] },
       { "when": "SKIPKVQ", "args": ["--kv-cache-dtype-skip-layers", "${SKIPKVQ}"] },
-      "--speculative-config", "{\"model\":\"${MODELS:-/home/lcy/Models}/Merkyor-W4A4/NVFP4/W4A4/DFlash2-FP8\",\"method\":\"dflash\",\"num_speculative_tokens\":${K:-10},\"quantization\":\"compressed-tensors\",\"draft_tensor_parallel_size\":${DRAFT_TP:-2}${SPEC_EXTRA}}",
+      "--speculative-config", "{\"model\":\"${MODELS:-/home/lcy/Models}/${DRAFT_SUBDIR:-Merkyor-W4A4/NVFP4/W4A4/DFlash2-FP8}\",\"method\":\"dflash\",\"num_speculative_tokens\":${K:-10}${DRAFT_QUANT:-,\"quantization\":\"compressed-tensors\"},\"draft_tensor_parallel_size\":${DRAFT_TP:-2}${SPEC_EXTRA}}",
       "--no-enable-flashinfer-autotune",
       "--enable-prefix-caching",
       "--enable-prompt-tokens-details",
