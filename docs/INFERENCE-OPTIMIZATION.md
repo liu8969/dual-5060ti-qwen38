@@ -83,10 +83,14 @@ K 已在甜点、draft_tp 无收益 → 只剩"草稿本身更强"这条路。�
 
 ## 6. 工具与资产
 
-- **压测 MCP（只测不调）**：`~/Documents/ubuntu/model-bench-mcp/`
-  - `bin/bench.mjs doctor|live|mcp` —— 只读自检端点 / 面板实时快照 / MCP server
-  - `bin/bench-run.mjs` —— pi-ai 做请求内核 + `/metrics` 差分算逐位接受率（**待补 model 的 `input` 等字段**）
+- **压测工具（只测不调）**：实体在 `~/Documents/Skill-me/model-bench-mcp/`（git 仓库）；
+  `~/Documents/ubuntu/model-bench-mcp` 是**指向它的软链**（跨工作区写入需提权，要在项目上连续干活就把工作区设成 `~/Documents/Skill-me`）。
+  - `bin/bench.mjs`（doctor / live / mcp）、`bin/bench-run.mjs`（并发 + corpus + thinking/task）、
+    `bin/corpus.mjs`（题库）、`bin/prefill-probe.mjs`、`bin/wire-probe.mjs`
+  - 用法与参数以 skill **`model-bench`** 为准；**三个 MCP 工具目前尚未注册进 DSH**
+    （`~/.dsh/profiles/web/cordis.patch.yml` 里 0 条），当前按 CLI 调用
   - 边界：不启停引擎、不换 profile、不改配置、不读 `/proc` —— 启停与调优属 `gpu-model` 侧（modelctl）
+
 - **盒子上的测量资产**：`~/codebench/{measure_spec.py, ab_sweep3.sh, ab_depth.sh, longtasks.jsonl, repos/*}`
 - **端到端数据**：`docs/TEST-MATRIX.md` §8.6（深度扫描）、§8.10（A/B 方法论 + K 曲线 + 深度曲线）
 
