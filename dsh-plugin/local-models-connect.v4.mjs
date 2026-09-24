@@ -90,7 +90,7 @@ export const name = 'local-models-connect'
 export const inject = ['webServer', 'settings']
 
 /** 版本号 —— 自检报告里回显，方便确认页面上跑的是哪一版。 */
-const VERSION = '1.2.0'
+const VERSION = '1.3.0'
 
 /** 写入的设置命名空间（`llm-pi-ai` 的注册者见 dsh-llm-pi-ai）。 */
 const NS = 'llm-pi-ai'
@@ -1253,12 +1253,20 @@ function panelScript(autoHideMs) {
   // ── 头部锚点：找「在本地打开」那个分体控件的容器 ──
   // 它的 CSS module 类名是 <hash>_split —— 哈希会随构建变，所以用**行为特征**定位：
   // 一个 class 含 "_split" 的 div，里面带 aria-haspopup=menu 的箭头按钮。
+  // 页面里别处也可能有分体控件（别的下拉），所以优先取靠页面顶部的那一个（会话头部在顶部），
+  // 并且跳过隐藏的；都不在顶部时退回第一个 —— 挂错位置至少是看得见的，挂不上是静默的。
   function findAnchor() {
+    let first = null;
     const splits = document.querySelectorAll('div[class*="_split"]');
     for (let i = 0; i < splits.length; i++) {
-      if (splits[i].querySelector('button[aria-haspopup="menu"]') !== null) return splits[i];
+      const el = splits[i];
+      if (el.querySelector('button[aria-haspopup="menu"]') === null) continue;
+      const rect = el.getBoundingClientRect();
+      if (rect.width === 0) continue;
+      if (rect.top < 160) return el;
+      if (first === null) first = el;
     }
-    return null;
+    return first;
   }
 
   function makeButton(label, hint, withDot) {
