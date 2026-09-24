@@ -6,13 +6,13 @@
  *   4. 实机冒烟：真打 192.168.0.119:8080（不在线只记 warn，不算失败）。
  *
  * 跑法：node dsh-plugin/tests/local-models-connect.test.mjs [插件路径]
- *       （不给路径就测同仓库的 ../local-models-connect.v8.mjs）
+ *       （不给路径就测同仓库的 ../local-models-connect.v9.mjs）
  */
 import assert from 'node:assert/strict'
 import http from 'node:http'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
-const MODULE_PATH = process.argv[2] ?? fileURLToPath(new URL('../local-models-connect.v8.mjs', import.meta.url))
+const MODULE_PATH = process.argv[2] ?? fileURLToPath(new URL('../local-models-connect.v9.mjs', import.meta.url))
 const plugin = await import(pathToFileURL(MODULE_PATH).href)
 
 let pass = 0
@@ -666,6 +666,9 @@ await ta('面板：单按钮挂到「在本地打开」左边且间距取容器 
   assert.match(script, /body\.style\.maxHeight = '';/, '每次展示先清掉上次可能留下的限高')
   assert.match(script, /if \(top \+ height > room\) top = Math\.max\(margin, room - height\);/, '放不下先往上挪')
   assert.match(script, /body\.style\.overflow = 'auto';/, '挪了还放不下才退化成可滚动')
+  // 内部滚动不重排：placeBox() 会清限高再量（白做一次强制重排），位置也不需要更新
+  assert.match(script, /if \(box !== null && \(event\.target === box \|\| box\.contains\(event\.target\)\)\) return;/,
+    '弹窗内部滚动只忽略，不重排（省掉每次滚动一次的强制重排）')
   assert.doesNotMatch(script, /box\.addEventListener\('click', hideBox\)/, '整块弹窗不再可点')
   assert.doesNotMatch(script, /点这里/, '那行「点这里…」提示已去掉')
   assert.doesNotMatch(style, /#lmc-box \{[^}]*cursor: pointer/, '外框不该长得像个按钮')

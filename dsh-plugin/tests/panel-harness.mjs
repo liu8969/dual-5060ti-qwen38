@@ -22,7 +22,7 @@ import http from 'node:http'
 import { writeFileSync } from 'node:fs'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
-const MODULE = process.argv[2] ?? fileURLToPath(new URL('../local-models-connect.v8.mjs', import.meta.url))
+const MODULE = process.argv[2] ?? fileURLToPath(new URL('../local-models-connect.v9.mjs', import.meta.url))
 const AUTO_HIDE_MS = Number(process.argv[3] ?? 9000)
 const PORT = Number(process.argv[4] ?? 18181)
 // 第 5 个参数：端口行数（'long' = 60）。用来验「内容高于视口下方空间」与「比整个视口还高」两条退路。

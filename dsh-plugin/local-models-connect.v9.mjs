@@ -90,7 +90,7 @@ export const name = 'local-models-connect'
 export const inject = ['webServer', 'settings']
 
 /** 版本号 —— 自检报告里回显，方便确认页面上跑的是哪一版。 */
-const VERSION = '1.7.0'
+const VERSION = '1.7.1'
 
 /** 写入的设置命名空间（`llm-pi-ai` 的注册者见 dsh-llm-pi-ai）。 */
 const NS = 'llm-pi-ai'
@@ -1645,8 +1645,12 @@ function panelScript(autoHideMs) {
   document.addEventListener('keydown', function (event) { if (event.key === 'Escape') hideBox(); });
   window.addEventListener('resize', placeBox);
   document.addEventListener('scroll', function (event) {
-    if (box !== null && (event.target === box || box.contains(event.target))) placeBox();
-    else hideBox();
+    // 弹窗**内部**滚动（只有"内容比视口还高"那一种情况才滚得动）：位置不用变，
+    // 也没必要重排 —— placeBox() 会先清掉限高再量，等于每次滚动事件白做一次强制重排。
+    // （曾怀疑它会把 scrollTop 打回 0；实测不会：清-量-复写在同一轮同步任务里，浏览器
+    //   看不到中间那个"不再溢出"的状态。所以这里是省开销，不是修 bug。）
+    if (box !== null && (event.target === box || box.contains(event.target))) return;
+    hideBox();
   }, true);
 
   // 页面加载时只读缓存（不打网络）：状态点是热的。

@@ -39,11 +39,11 @@ models:
 
 ## 3. 新一代：`local-models-connect.v1`
 
-源码：[`../dsh-plugin/local-models-connect.v8.mjs`](../dsh-plugin/local-models-connect.v8.mjs)
+源码：[`../dsh-plugin/local-models-connect.v9.mjs`](../dsh-plugin/local-models-connect.v9.mjs)
 测试：[`../dsh-plugin/tests/local-models-connect.test.mjs`](../dsh-plugin/tests/local-models-connect.test.mjs)（81 条，`node dsh-plugin/tests/local-models-connect.test.mjs`）
 面板验证台：[`../dsh-plugin/tests/panel-harness.mjs`](../dsh-plugin/tests/panel-harness.mjs)（起一个仿真的会话头部 + 桩路由，供真浏览器驱动；真 GUI 要 token，而凭据不进 agent 命令）
 
-装到 `~/.dsh/plugins/local-models-connect.v8.mjs`，并在
+装到 `~/.dsh/plugins/local-models-connect.v9.mjs`，并在
 `~/.dsh/profiles/web/cordis.patch.yml` 里挂一条（见 §6）。**它取代了 `local-models-sync.v1`**。
 
 它做三件事：
@@ -277,7 +277,7 @@ v1 只强制引擎**广告出来的事实**（`contextWindow` / `maxTokens` 上�
 ```yaml
 - insert:
     - id: local-models-connect
-      name: "/home/lcy/.dsh/plugins/local-models-connect.v8.mjs"
+      name: "/home/lcy/.dsh/plugins/local-models-connect.v9.mjs"
       config:
         hosts: ['192.168.0.119']          # 种子主机：唯一的扫描范围，要加机器改这一行
         ports: [8080, 8000, 30000, 8081, 11434, 1234]
@@ -333,7 +333,7 @@ curl -sS http://127.0.0.1:3080/local-models-connect/state | python3 -m json.tool
 ```bash
 cp ~/.dsh/profiles/web/cordis.patch.yml.bak-before-local-models-connect-<ts> \
    ~/.dsh/profiles/web/cordis.patch.yml
-rm ~/.dsh/plugins/local-models-connect.v8.mjs
+rm ~/.dsh/plugins/local-models-connect.v9.mjs
 ```
 
 `settings.yaml` 的写入是幂等的（值没变就不写），回滚插件不会把设置改回去。
