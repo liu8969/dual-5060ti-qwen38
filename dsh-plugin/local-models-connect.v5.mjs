@@ -90,7 +90,7 @@ export const name = 'local-models-connect'
 export const inject = ['webServer', 'settings']
 
 /** 版本号 —— 自检报告里回显，方便确认页面上跑的是哪一版。 */
-const VERSION = '1.3.0'
+const VERSION = '1.4.0'
 
 /** 写入的设置命名空间（`llm-pi-ai` 的注册者见 dsh-llm-pi-ai）。 */
 const NS = 'llm-pi-ai'
@@ -1102,7 +1102,13 @@ function singleFlight(job) {
  * 省掉 v1 那种 `\`` 转义（改一个颜色都要数反斜杠）。
  */
 /**
- * 面板：两个按钮挂进**会话头部的 utilities 行**、「在本地打开」那个分体控件的**左边**。
+ * 面板：**一个**按钮挂进**会话头部的 utilities 行**、「在本地打开」那个分体控件的**左边**。
+ *
+ * 为什么只有一个按钮：原来「接入本地模型」与「自检」是两条动作、两条报告，而它们探的是同一批
+ * 端点、走的是同一段探测代码 —— 用户一眼就看出「有点重合」。现在一次点击 = 接入（发现 + 写声明）
+ * 再接一次自检（只读判定），报告合成一段：接入的结果在上、自检的结论（汇总行 + 只有非 ok 的明细）
+ * 在下。只读能力没有消失，只是不再占一个按钮：CLI 的 `GET /selfcheck`、`?dry=1`、
+ * `config.autoApply:false` 都还在。
  *
  * 样式不自己发明 —— 直接抄 `dsh-client-ui-open-in-app` 的度量（28px 高 / 14px 圆角 /
  * .5px `border-l4` / 11px·16px 字 / 同 padding），并复用同一批 `--dsw-alias-*` 设计令牌，
@@ -1115,7 +1121,7 @@ function singleFlight(job) {
  * 拿不到头部（还没进会话）时退回右下角浮动，按钮不会凭空消失。
  */
 const PANEL_STYLE = `
-#lmc-tools { display: inline-flex; align-items: center; gap: 6px; }
+#lmc-tools { display: inline-flex; align-items: center; gap: 8px; }
 #lmc-tools.lmc-float { position: fixed; right: 18px; bottom: 18px; z-index: 2147483000; }
 #lmc-tools .lmc-btn { box-sizing: border-box; height: 28px; border-radius: 14px;
   border: .5px solid var(--dsw-alias-border-l4); background: transparent;
@@ -1159,7 +1165,7 @@ function panelScript(autoHideMs) {
   window.__localModelsConnectInstalled = true;
 
   let tools = null, box = null, dot = null;
-  let checkButton = null, checkLabel = null, runButton = null, runLabel = null;
+  let runButton = null, runLabel = null;
   let hideTimer = null, observerTimer = null, pendingVerdict = null;
 
   // ── 报告区：fixed 定位，绝不占布局 ──
@@ -1200,9 +1206,10 @@ function panelScript(autoHideMs) {
     return await response.json();
   }
 
-  function renderRun(report) {
-    if (!report) return '没有返回';
-    if (report.error) return '出错了：' + report.error;
+  /** 接入那半边的报告行。 */
+  function renderRunLines(report) {
+    if (!report) return ['没有返回'];
+    if (report.error) return ['出错了：' + report.error];
     const lines = ['接入检查 @ ' + (report.at || '') + (report.dryRun ? '（dry-run，未写入）' : '')];
     for (const t of report.targets || []) {
       const at = (t.host || '?') + ':' + (t.port || '?');
@@ -1228,45 +1235,68 @@ function panelScript(autoHideMs) {
     }
     if (dropped.length > 0) lines.push('未采纳：' + dropped.join('；'));
     lines.push(report.wrote ? '已写入设置（settings 热重载）' : '未写入设置');
-    lines.push('（点这里、再点按钮、按 Esc 或等一会儿都会收起）');
-    return lines.join('\\n');
+    return lines;
   }
 
-  function renderCheck(report) {
-    if (!report) return '没有返回';
-    if (report.error) return '出错了：' + report.error;
+  /** 自检那半边的报告行：一行汇总 + **只**列非 ok 的明细（全 ok 时不刷屏）。 */
+  function renderCheckLines(report) {
+    if (!report) return ['自检：没有返回'];
+    if (report.error) return ['自检出错了：' + report.error];
     const s = report.summary || {};
-    const icon = { ok: '✓', warn: '!', fail: '✗' };
-    const lines = ['自检 ' + String(report.verdict).toUpperCase() + ' @ ' + report.at,
-      '候选 ' + s.candidates + ' · 存活 ' + s.reachable + ' · 有模型 ' + s.withModels +
-      ' · 已接入 ' + s.linkedProviders + ' · 待接入 ' + s.pendingEndpoints,
-      '通过 ' + s.ok + ' · 提醒 ' + s.warn + ' · 失败 ' + s.fail, ''];
+    const icon = { warn: '!', fail: '✗' };
+    const lines = ['—— 自检 ' + String(report.verdict).toUpperCase() + '：' +
+      s.ok + ' 通过 · ' + s.warn + ' 提醒 · ' + s.fail + ' 失败'];
     for (const c of report.checks || []) {
+      if (c.level === 'ok') continue;
       lines.push((icon[c.level] || '·') + ' ' + c.title);
-      if (c.detail && c.level !== 'ok') lines.push('    ' + c.detail);
+      if (c.detail) lines.push('    ' + c.detail);
     }
-    lines.push('');
-    lines.push('（点这里、再点按钮、按 Esc 或等一会儿都会收起）');
-    return lines.join('\\n');
+    return lines;
   }
 
-  // ── 头部锚点：找「在本地打开」那个分体控件的容器 ──
-  // 它的 CSS module 类名是 <hash>_split —— 哈希会随构建变，所以用**行为特征**定位：
-  // 一个 class 含 "_split" 的 div，里面带 aria-haspopup=menu 的箭头按钮。
-  // 页面里别处也可能有分体控件（别的下拉），所以优先取靠页面顶部的那一个（会话头部在顶部），
-  // 并且跳过隐藏的；都不在顶部时退回第一个 —— 挂错位置至少是看得见的，挂不上是静默的。
-  function findAnchor() {
-    let first = null;
-    const splits = document.querySelectorAll('div[class*="_split"]');
+  function renderReport(run, check) {
+    return renderRunLines(run)
+      .concat(renderCheckLines(check))
+      .concat(['（点这里、再点按钮、按 Esc 或等一会儿都会收起）'])
+      .join('\\n');
+  }
+
+  // ── 头部锚点：找「在本地打开」那条 slot 条目，插到它**最外层**前面 ──
+  //
+  // 为什么必须爬到最外层：头部容器 .…_headerUtilities 是 display:flex; gap:8px
+  // （dsh-client-ui-conversation），而这 8px 只作用在**它的直接子项**之间。分体控件的
+  // div.…_split 并不是直接子项 —— slot 条目外面还有包裹（open-in-app 的 Menu 包着它的
+  // anchor）。插在 _split 前面 = 插进包裹层内部，容器的 gap 够不着 →
+  // 与左边邻居贴成 0px（2026-09-24 用户实测到的就是 0）。爬到容器的直接子项再插，两边各得 8px。
+  //
+  // 为什么先限定在容器内找：页面里另有 2 个包也定义了 _split（deliverables、trajectory），
+  // 全局匹配会挂错地方。容器类名的本地名 _headerUtilities 稳定，哈希部分会随构建变。
+  //
+  // 注意：这段代码整体活在一个模板字符串里，所以**这里不能出现反引号**（会提前闭合）。
+  function findHeaderContainer() {
+    return document.querySelector('[class*="_headerUtilities"]');
+  }
+
+  function findSplitWithin(root) {
+    const splits = root.querySelectorAll('div[class*="_split"]');
     for (let i = 0; i < splits.length; i++) {
       const el = splits[i];
       if (el.querySelector('button[aria-haspopup="menu"]') === null) continue;
-      const rect = el.getBoundingClientRect();
-      if (rect.width === 0) continue;
-      if (rect.top < 160) return el;
-      if (first === null) first = el;
+      if (el.getBoundingClientRect().width === 0) continue;
+      return el;
     }
-    return first;
+    return null;
+  }
+
+  function findAnchor() {
+    const container = findHeaderContainer();
+    const split = findSplitWithin(container !== null ? container : document);
+    if (split === null) return null;
+    if (container === null) return split;
+    // 爬到容器的直接子项 —— 这一步与我自己的节点无关（我只是它的前一个兄弟），所以幂等。
+    let node = split;
+    while (node.parentElement !== null && node.parentElement !== container) node = node.parentElement;
+    return node.parentElement === container ? node : split;
   }
 
   function makeButton(label, hint, withDot) {
@@ -1312,30 +1342,19 @@ function panelScript(autoHideMs) {
     box.addEventListener('click', hideBox);
     tools.appendChild(box);
 
-    const check = makeButton('自检', '只读检查：端点通不通、认出什么模型、声明与引擎对不对得上', true);
-    checkButton = check.button;
-    checkLabel = check.label;
-    checkButton.addEventListener('click', function () {
-      invoke(checkButton, checkLabel, '自检中…', '自检', async function () {
-        const report = await post(API.selfcheck);
-        setDot(report && report.verdict);
-        showBox(renderCheck(report));
-      });
-    });
-
-    const run = makeButton('接入本地模型', '扫描种子主机端口，把发现到的本地模型自动接进模型列表', false);
-    runButton = run.button;
-    runLabel = run.label;
+    const main = makeButton('接入本地模型', '发现本地端点并接进模型列表，随后做一次只读自检', true);
+    runButton = main.button;
+    runLabel = main.label;
     runButton.addEventListener('click', function () {
       invoke(runButton, runLabel, '接入中…', '接入本地模型', async function () {
-        const report = await post(API.run);
-        showBox(renderRun(report));
+        // 顺序不能反：run 可能写设置，自检要反映**写完之后**的声明。
+        const run = await post(API.run);
         const check = await post(API.selfcheck);
         setDot(check && check.verdict);
+        showBox(renderReport(run, check));
       });
     });
 
-    tools.appendChild(checkButton);
     tools.appendChild(runButton);
   }
 

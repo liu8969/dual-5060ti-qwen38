@@ -39,10 +39,11 @@ models:
 
 ## 3. 新一代：`local-models-connect.v1`
 
-源码：[`../dsh-plugin/local-models-connect.v4.mjs`](../dsh-plugin/local-models-connect.v4.mjs)
-测试：[`../dsh-plugin/tests/local-models-connect.test.mjs`](../dsh-plugin/tests/local-models-connect.test.mjs)（62 条，`node dsh-plugin/tests/local-models-connect.test.mjs`）
+源码：[`../dsh-plugin/local-models-connect.v5.mjs`](../dsh-plugin/local-models-connect.v5.mjs)
+测试：[`../dsh-plugin/tests/local-models-connect.test.mjs`](../dsh-plugin/tests/local-models-connect.test.mjs)（65 条，`node dsh-plugin/tests/local-models-connect.test.mjs`）
+面板验证台：[`../dsh-plugin/tests/panel-harness.mjs`](../dsh-plugin/tests/panel-harness.mjs)（起一个仿真的会话头部 + 桩路由，供真浏览器驱动；真 GUI 要 token，而凭据不进 agent 命令）
 
-装到 `~/.dsh/plugins/local-models-connect.v4.mjs`，并在
+装到 `~/.dsh/plugins/local-models-connect.v5.mjs`，并在
 `~/.dsh/profiles/web/cordis.patch.yml` 里挂一条（见 §6）。**它取代了 `local-models-sync.v1`**。
 
 它做三件事：
@@ -130,22 +131,45 @@ curl -sS "http://127.0.0.1:3080/local-models-connect/run?dry=1" -X POST | python
 curl -sS http://127.0.0.1:3080/local-models-connect/selfcheck | python3 -m json.tool
 ```
 
-页面上的两个按钮**挂在会话头部的 utilities 行里、「在本地打开」那个分体控件的左边**
-（同一个父容器、紧跟它前面；拿不到头部时退回右下角浮动，按钮不会凭空消失）：
+页面上是**一个**按钮，**挂在会话头部的 utilities 行里、「在本地打开」那个分体控件的左边**
+（拿不到头部时退回右下角浮动，按钮不会凭空消失）：
 
-* 「自检」带一个状态点（最近一次自检的 verdict：绿/黄/红），「接入本地模型」没有；
-* 两个按钮走同一个工厂、同一个类名，度量照抄 `dsh-client-ui-open-in-app` 的
-  28px 高 / 14px 圆角 / `.5px` `border-l4` / 11px·16px 字 / 同 padding，
-  并复用同一批 `--dsw-alias-*` 令牌 —— 所以深浅色主题、hover、disabled 都跟着 DSH 走；
-* 报告弹窗是 `position: fixed`（**不参与布局、不顶开页面**），并且点它自己 / 按 Esc /
-  滚页面 / 超时（`autoHideMs`，默认 12 秒）都会收起。旧版把报告留在文档流里，
+* **一次点击 = 接入 + 自检，报告合一**。原来「接入本地模型」与「自检」是两个按钮：它们探的是
+  同一批端点、走的是同一段探测代码，功能明显重合（2026-09-24 用户点出来的）。现在点一下先
+  `POST /run`（发现 + 写声明）再 `POST /selfcheck`（只读判定），报告是**一段**：
+  上半接入结果（每个候选端点一行 + 每个 provider 一行 + 未采纳 + 是否写入），
+  下半自检结论（一行汇总 + **只列非 ok 的明细**，全绿时不刷屏）。顺序不能反 —— 自检要反映
+  **写完之后**的声明。
+  只读能力没有消失，只是不再占一个按钮：CLI 的 `GET /selfcheck`、`?dry=1`、
+  `config.autoApply:false` 都还在，开机自动探测也仍旧跑。
+* 按钮带一个状态点（最近一次自检的 verdict：绿/黄/红）。
+* 度量照抄 `dsh-client-ui-open-in-app` 的 28px 高 / 14px 圆角 / `.5px` `border-l4` /
+  11px·16px 字 / 同 padding，并复用同一批 `--dsw-alias-*` 令牌 —— 深浅色主题、hover、
+  disabled 都跟着 DSH 走。
+* 报告弹窗是 `position: fixed`（**不参与布局、不顶开页面**），并且点它自己 / 再点按钮 /
+  按 Esc / 滚页面 / 超时（`autoHideMs`，默认 12 秒）都会收起。旧版把报告留在文档流里，
   点一次就永久占一块地方 —— 2026-09-24 用户点名要改的就是这个。
 
 样式走独立的 `style` 注入行、脚本走 `script` 行（v1 把 CSS 塞在模板字符串里，改一个颜色
 都要数反斜杠）。页面加载时只读 `/state` 的缓存，不打网络。
 
-定位锚点用的是**行为特征**而不是哈希类名：找 `div[class*="_split"]` 里带
-`button[aria-haspopup="menu"]` 的那个（CSS module 的哈希随构建变，`_split` 这个本地名不变）。
+### 锚点：为什么不只是「找 `_split`」
+
+两处都不是风格问题，是**必须**这么做：
+
+1. **先限定在头部容器内**（`[class*="_headerUtilities"]`）。全页面另有 2 个包也定义了 `_split`
+   （`dsh-client-ui-deliverables`、`dsh-client-ui-trajectory`），全局匹配会挂到别人家去。
+2. **爬到容器的直接子项再插**。容器是 `display:flex; gap:8px`（`dsh-client-ui-conversation`），
+   而这 8px 只作用在**它的直接子项**之间；`<div class="…_split">` 并不是直接子项 ——
+   slot 条目外面还有包裹（open-in-app 的 `Menu` 包着它的 anchor）。插在 `_split` 前面
+   = 插进包裹层内部，容器的 gap 够不着 → **与左边邻居贴成 0px**
+   （2026-09-24 用户的实测：`接入本地模型` 与「打开终端」之间是 0）。
+
+   注：用户看到的「打开终端」就是这条分体控件 —— 它的 Tooltip label 是「在本地打开」，
+   而主按钮的 `aria-label` 是 `open.title` = 「在 {app} 中打开工作目录」，当前记住的 app 是终端。
+
+定位仍按**行为特征**：`div[class*="_split"]` + 内含 `button[aria-haspopup="menu"]`
+（CSS module 的哈希随构建变，`_split` / `_headerUtilities` 这些本地名不变）。
 
 ## 5. v1 的实测记录（保留，作为「不能信手写声明」的第一手证据）
 
@@ -187,7 +211,7 @@ v1 只强制引擎**广告出来的事实**（`contextWindow` / `maxTokens` 上�
 ```yaml
 - insert:
     - id: local-models-connect
-      name: "/home/lcy/.dsh/plugins/local-models-connect.v4.mjs"
+      name: "/home/lcy/.dsh/plugins/local-models-connect.v5.mjs"
       config:
         hosts: ['192.168.0.119']          # 种子主机：唯一的扫描范围，要加机器改这一行
         ports: [8080, 8000, 30000, 8081, 11434, 1234]
@@ -243,7 +267,7 @@ curl -sS http://127.0.0.1:3080/local-models-connect/state | python3 -m json.tool
 ```bash
 cp ~/.dsh/profiles/web/cordis.patch.yml.bak-before-local-models-connect-<ts> \
    ~/.dsh/profiles/web/cordis.patch.yml
-rm ~/.dsh/plugins/local-models-connect.v4.mjs
+rm ~/.dsh/plugins/local-models-connect.v5.mjs
 ```
 
 `settings.yaml` 的写入是幂等的（值没变就不写），回滚插件不会把设置改回去。
@@ -310,20 +334,32 @@ Cordis 只在 `name`（也就是文件路径）变化时才重新 `import` 模�
 
 ### 面板（2026-09-24，真浏览器实测）
 
-拿插件现取的注入行 + 桩页搭台驱动，避开把 GUI 的 token 写进对话记录；桩的头部形状
-（`div[class*="_split"]` 内含 `button[aria-haspopup=menu]`）与令牌值都抄自 DSH 自己的源码：
+用 [`panel-harness.mjs`](../dsh-plugin/tests/panel-harness.mjs) 起仿真头部 + 桩路由驱动，
+避开把 GUI 的 token 写进对话记录；头部的**形状与令牌值都抄自 DSH 自己的源码**
+（容器 `.…_headerUtilities{display:flex;gap:8px}`、分体控件 `.…_split{28px/14px/.5px}`，
+以及**分体控件外面那层 slot 条目包裹** —— 少了这层就验不出下面那个 bug）。
 
-* `#lmc-tools` 是分体控件的**紧邻前一个兄弟**（`tools.nextElementSibling === split`），
-  两者间距 8px —— 与头部自己的 items 间距一致；
-* 两个按钮计算样式完全相同：`28px | 14px | 11px | 16px | 5px 10px | flex | 1px`，
+v5（单按钮版）：
+
+* `#lmc-tools` 是容器的**直接子项**、且是 open-in-app 那条 slot 条目的**前一个兄弟**；
+  与左邻条的间距 **8px**、与右侧分体控件条目的间距 **8px** —— 都是容器自己的 `gap`；
+* 只有一个 `.lmc-btn`（标签「接入本地模型」），计算样式 `28px | 14px | 11px | 16px | 5px 10px | 1px`，
   与原生分体控件容器同档（它也是 28px 高 / 14px 圆角 / `.5px` 边框渲染成 1px）；
-* 弹窗 `position: fixed`：展示前后头部高度都是 45、分体控件左边缘都是 243、
-  文档高度不变 —— **不顶开页面**；右边缘与按钮组右边缘**逐像素对齐**（1381 / 1381）；
-* 收起四条路都验过：点弹窗、按 Esc、超时（`autoHideMs`）、滚动页面；
-* 把 `#lmc-tools` 从 DOM 里删掉 → MutationObserver 300ms 后重挂，且**不重复**（1 个实例）；
-* 0 条 console 错误、请求全是预期的那几个。
+* 一次点击 = 3 个请求（`state` → `run` → `selfcheck`），报告是**一段**：接入行在上、
+  `—— 自检 WARN：4 通过 · 2 提醒 · 0 失败` 汇总行在下，**ok 的条目被滤掉**、warn 的明细保留；
+  状态点转 `warn`；
+* 弹窗 `position: fixed`：展示前后头部高度都是 45、文档高度不变 —— **不顶开页面**；
+  右边缘与按钮组右边缘**逐像素对齐**；
+* 收起四条路都验过：点弹窗、按 Esc、超时（`autoHideMs`）、滚动页面；把 `#lmc-tools` 从 DOM
+  里删掉 → MutationObserver 300ms 后重挂，且**不重复**（1 个实例）；
+* 0 条 console 错误。
 
-**踩到并修掉的一个真 bug**：弹窗原本用 `max-width` + shrink-to-fit，于是「可用宽度」会被上一次
+**红绿对照（这次的 0px bug）**：把 HEAD 里那一版 v4 交给同一个验证台跑 ——
+`tools.parentElement` 是包裹层 `Ss22bb_entry`（不是容器），`gapToSplitPx` **0**，两个按钮；
+换成 v5 后 `directChildOfContainer: true`、`gapRightPx/gapLeftPx` 都是 **8**，一个按钮。
+用户报的现象与红侧完全一致，所以这个验证台是能抓住它的，不是"跑了个寂寞"。
+
+**上一次修掉的一个真 bug**：弹窗原本用 `max-width` + shrink-to-fit，于是「可用宽度」会被上一次
 写下的 `left` 截断 —— 量到的是「剩下的空间」而不是内容宽度，每次重排都把弹窗再往左推一截
 （实测右边缘差了 **59px**）。改成 CSS 里写死 `width: min(72vw, 560px)` + `box-sizing: border-box`
 后，`offsetWidth` 与 `left` 无关，重复展示两次的 `left` 完全相同（821px = 1381 − 560）。
@@ -352,4 +388,5 @@ Cordis 只在 `name`（也就是文件路径）变化时才重新 `import` 模�
   那是个**空转的 ✓**：没有任何端点可关联，它什么都没验证）；凭据那条也标注了
   「与端点是否连得通无关」，免得和两条 ✗ 并排时被读成「其余正常」。
 
-装上之后**刷新一次页面**才会看到新面板（旧页面里还是 v1 那个「同步本地模型」按钮）。
+插件换版后**刷新一次页面**才会看到新面板 —— 已渲染的页面里还是上一版注入进去的脚本
+（2026-09-24 从「两个按钮」变成「一个按钮」时就是这样）。

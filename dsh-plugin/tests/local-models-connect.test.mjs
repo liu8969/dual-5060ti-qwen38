@@ -6,13 +6,13 @@
  *   4. 实机冒烟：真打 192.168.0.119:8080（不在线只记 warn，不算失败）。
  *
  * 跑法：node dsh-plugin/tests/local-models-connect.test.mjs [插件路径]
- *       （不给路径就测同仓库的 ../local-models-connect.v4.mjs）
+ *       （不给路径就测同仓库的 ../local-models-connect.v5.mjs）
  */
 import assert from 'node:assert/strict'
 import http from 'node:http'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
-const MODULE_PATH = process.argv[2] ?? fileURLToPath(new URL('../local-models-connect.v4.mjs', import.meta.url))
+const MODULE_PATH = process.argv[2] ?? fileURLToPath(new URL('../local-models-connect.v5.mjs', import.meta.url))
 const plugin = await import(pathToFileURL(MODULE_PATH).href)
 
 let pass = 0
@@ -600,7 +600,7 @@ await ta('端到端：新环境（没有任何 provider）→ run 建出 provide
   } finally { await web.close(); await vllm.close() }
 })
 
-await ta('面板：按钮挂到「在本地打开」左边、度量与原生同档、弹窗会自己收起', async () => {
+await ta('面板：单按钮挂到「在本地打开」左边且间距取容器 gap、报告合一、弹窗会自己收起', async () => {
   const host = makeHost()
   plugin.apply(host.ctx, { autoProbe: false, autoHideMs: 4321 })
   const table = []
@@ -624,14 +624,33 @@ await ta('面板：按钮挂到「在本地打开」左边、度量与原生同�
   assert.match(style, /border-radius: 14px/)
   assert.match(style, /font-size: 11px/)
 
-  // ③ 两个按钮走同一个工厂 = 同一套大小风格；只有「自检」多一个状态点
-  assert.match(script, /makeButton\('自检'/)
-  assert.match(script, /makeButton\('接入本地模型'/)
-  assert.equal((script.match(/className = 'lmc-btn'/g) || []).length, 1, '两个按钮共用一个类名')
-  assert.match(script, /tools\.appendChild\(checkButton\)/)
+  // ③ 只有一个按钮（2026-09-24 把「自检」并进来了），一个工厂一个类名 = 同一套大小风格
+  assert.match(script, /makeButton\('接入本地模型'/, '只留一个按钮')
+  assert.doesNotMatch(script, /makeButton\('自检'/, '「自检」不再是独立按钮')
+  assert.equal((script.match(/= makeButton\(/g) || []).length, 1, '只调一次 makeButton（函数定义不算）')
+  assert.equal((script.match(/className = 'lmc-btn'/g) || []).length, 1)
   assert.match(script, /tools\.appendChild\(runButton\)/)
+  assert.doesNotMatch(script, /checkButton|checkLabel/)
 
-  // ④ 弹窗不常驻：不占布局 + 自动收起 + 点它收起 + Esc 收起
+  // ④ 一次点击 = 接入 + 自检，报告合一；顺序不能反（自检要反映写完之后的状态）
+  const runAt = script.indexOf('post(API.run)')
+  const checkAt = script.indexOf('post(API.selfcheck)')
+  assert.ok(runAt > 0 && checkAt > runAt, '先 run 后 selfcheck')
+  assert.match(script, /showBox\(renderReport\(run, check\)\)/, '两份报告合成一次渲染')
+  assert.match(script, /function renderRunLines/, '接入那半边')
+  assert.match(script, /function renderCheckLines/, '自检那半边')
+  assert.match(script, /function renderReport\(run, check\)/)
+  assert.match(script, /if \(c\.level === 'ok'\) continue;/, '自检只列非 ok 的明细，不全量刷屏')
+
+  // ⑤ 锚点：限定在头部容器内、并爬到容器的**直接子项**（容器的 gap 才作用得到）
+  assert.match(script, /_headerUtilities/, '先找头部容器')
+  assert.match(script, /findSplitWithin\(container !== null \? container : document\)/, '在容器内找分体控件')
+  assert.match(script, /while \(node\.parentElement !== null && node\.parentElement !== container\) node = node\.parentElement;/,
+    '爬到容器的直接子项再插，否则拿不到容器的 8px')
+  assert.match(style, /#lmc-tools \{ display: inline-flex; align-items: center; gap: 8px; \}/,
+    '组内间距与容器的 gap 一致')
+
+  // ⑥ 弹窗不常驻：不占布局 + 自动收起 + 点它收起 + Esc 收起
   assert.match(style, /#lmc-box \{ position: fixed/, '弹窗必须 fixed，否则会顶开页面')
   assert.match(script, /const AUTO_HIDE_MS = 4321;/, 'autoHideMs 要真的流进注入脚本')
   assert.match(script, /setTimeout\(hideBox, AUTO_HIDE_MS\)/)
