@@ -185,12 +185,12 @@ v1 只强制引擎**广告出来的事实**（`contextWindow` / `maxTokens` 上�
 ### 安装后的那一次重启（重要）
 
 `~/.dsh/profiles/web/package.json` 里的 `patchReload: "live"` 是 **2026-09-23 17:47:48** 写进去的，
-而当前 `dsh web` 进程起于 **17:46:04** —— 早于它。也就是说**这个进程启动时并没有挂上
+而当时那个 `dsh web` 进程起于 **17:46:04** —— 早于它。也就是说**那个进程启动时并没有挂上
 cordis-plugin-hmr**，`cordis.patch.yml` 的改动不会被重放（实测：改完 patch、请求新路由仍 404，
 `journalctl -u dsh-web` 里一条相关日志都没有）。源码见 `lib/profile-boot-*.js`：
 `patchReload === "live"` 的判断在 boot 时做一次，而且整段包在静默的 try/catch 里。
 
-所以**装完必须重启一次**：
+所以**装完必须重启一次**（2026-09-24 已执行，之后新路由立即 200）：
 
 ```bash
 sudo systemctl restart dsh-web
@@ -198,9 +198,9 @@ sleep 8
 curl -sS http://127.0.0.1:3080/local-models-connect/state | python3 -m json.tool
 ```
 
-重启之后 `patchReload: live` 就生效了，此后**再改 patch 才是真的保存即生效**。
-重启会打断正在进行的会话 —— 挑个空的时候做。新 URL（带 token）会写进
-`~/.dsh/last-web-url.txt`。
+**重启之后** `patchReload: live` 才真正生效，此后改 patch 才是「保存即生效」；
+在那之前它只是 manifest 里的一行字。重启会打断正在进行的会话 —— 挑个空的时候做。
+新 URL（带 token）会写进 `~/.dsh/last-web-url.txt`；页面也要刷新一次才会出现新面板。
 
 ### 回滚
 
@@ -246,9 +246,23 @@ Cordis 只在 `name`（也就是文件路径）变化时才重新 `import` 模�
   （`接入本地模型`、`__localModelsConnectInstalled`），且注入脚本里没有提前闭合的 `</script>`；
 * `POST /run?dry=1` → `wrote: false`，一个字节都没写。
 
-回归测试 62 条全过（纯逻辑 41 + 假引擎探测 5 + 端到端 15 + 实机冒烟 1）。
-真机 192.168.0.119:8080 冒烟：识别为 `vllm`，`Qwen3.8-27B-Q6-dual-5060ti`，上下文 150000。
+回归测试 62 条全过（纯逻辑 39 + 假引擎探测 5 + 端到端 17 + 实机冒烟 1 —— 数出来的是这样，
+不是估的）。真机 192.168.0.119:8080 冒烟：识别为 `vllm`，`Qwen3.8-27B-Q6-dual-5060ti`，上下文 150000。
 
-真机 `dsh web` 侧已确认 `dsh --profile web --dump-config` 的合成树里有新插件条目
-（`id: local-models-connect`，config 解析成 6 个端口）、stderr 0 行警告；
-但**要等 §6 那次重启**新路由才会出现在 3080 上。
+真机 `dsh web` 侧（`sudo systemctl restart dsh-web` 之后，PID 658997）：
+
+* `GET /state` → `version: 1.0.0`；开机自动探测已跑完：候选 6 个、存活 1 个（8080 → vllm /
+  `Qwen3.8-27B-Q6-dual-5060ti`@150000），`qwen-local: unchanged`、`wrote: false`
+  —— **没动那份手写声明**（它本来就对）；
+* `POST /selfcheck` → `verdict: ok`，6 条 ok / 0 warn / 0 fail，含「1 个本地 provider 的凭据
+  都能取到值」（真凭据服务里确实有 `QWEN_LOCAL_API_KEY`）；
+* `POST /run?dry=1` → `qwen-local: unchanged`、`wrote: false`；
+* v1 旧路径 `/local-models-sync/run` → 200，且回的是**新**结构（`providers`，不再是 `results`）；
+* `settings.yaml` 的 md5 与安装前一致（`23c40e46…`）；
+* 右下角面板在**真浏览器**里驱动过一遍（拿插件现取的注入行 + 桩路由搭页，避免把 GUI 的 token
+  写进对话记录）：两个按钮都在、状态点从 `/state` 缓存热起、点「自检」渲染出 `WARN` 与逐条明细
+  且状态点转 `warn`、点「接入本地模型」渲染出目标/改动/未采纳/已写入四段、把面板节点删掉后
+  MutationObserver 重挂且不重复（1 个面板 / 1 个 style）、0 条 console 错误、
+  4 个 fetch 全是预期的那四个（state → selfcheck → run → selfcheck）。
+
+装上之后**刷新一次页面**才会看到新面板（旧页面里还是 v1 那个「同步本地模型」按钮）。
