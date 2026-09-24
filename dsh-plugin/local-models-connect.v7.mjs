@@ -90,7 +90,7 @@ export const name = 'local-models-connect'
 export const inject = ['webServer', 'settings']
 
 /** 版本号 —— 自检报告里回显，方便确认页面上跑的是哪一版。 */
-const VERSION = '1.5.0'
+const VERSION = '1.6.0'
 
 /** 写入的设置命名空间（`llm-pi-ai` 的注册者见 dsh-llm-pi-ai）。 */
 const NS = 'llm-pi-ai'
@@ -99,6 +99,8 @@ const NS = 'llm-pi-ai'
 const ROUTE_STATE = '/local-models-connect/state'
 const ROUTE_RUN = '/local-models-connect/run'
 const ROUTE_SELFCHECK = '/local-models-connect/selfcheck'
+/** 面板用的一条路：run + selfcheck 跑完，直接回「排版好的三块视图」（见 buildPanelView）。 */
+const ROUTE_PANEL = '/local-models-connect/panel'
 const LEGACY_ROUTE_RUN = '/local-models-sync/run'
 
 /** 只碰内网 / 回环端点，避免拿没配 key 的远端 API 去试。 */
@@ -838,6 +840,8 @@ async function runConnect(ctx, config, options = {}) {
     const { profile, skipped } = mergeProfile(found, existing, { ...naming, displayName }, config)
     const changes = diffProfile(existing, profile)
     const action = existing === undefined ? 'created' : (changes.length > 0 ? 'updated' : 'unchanged')
+    // 面板要能说「已是最新（N 个模型）」，所以把结果里的模型条数一并带出来。
+    const modelCount = (profile.models ?? []).length
 
     if (skipped.length > 0) {
       // 全部被拒 → 不建一个空 provider（空 models 会被 llm-pi-ai 判为「resolves no models」直接报错）。
@@ -847,6 +851,7 @@ async function runConnect(ctx, config, options = {}) {
           baseURL: found.baseURL,
           action: 'skipped',
           changes: [],
+          modelCount,
           skipped,
           error: `广告的 ${found.models.length} 个模型上下文都读不到，未建 provider（要强行建请设 adoptUnknownContext: true）`
         })
@@ -857,12 +862,12 @@ async function runConnect(ctx, config, options = {}) {
     // 先判「有没有变化」，再判 dry-run —— 否则 dry-run 会把已经最新的 provider
     // 也报成「待写入」，读的人以为每次都有东西要改。
     if (changes.length === 0) {
-      providers.push({ provider: providerId, baseURL: found.baseURL, action, changes, ...(skipped.length ? { skipped } : {}) })
+      providers.push({ provider: providerId, baseURL: found.baseURL, action, changes, modelCount, ...(skipped.length ? { skipped } : {}) })
       taken.add(providerId)
       continue
     }
     if (dryRun) {
-      providers.push({ provider: providerId, baseURL: found.baseURL, action: 'would-change', changes, ...(skipped.length ? { skipped } : {}) })
+      providers.push({ provider: providerId, baseURL: found.baseURL, action: 'would-change', changes, modelCount, ...(skipped.length ? { skipped } : {}) })
       taken.add(providerId)
       continue
     }
@@ -871,9 +876,9 @@ async function runConnect(ctx, config, options = {}) {
       await ctx.settings.mutate(NS, [{ op: 'set', path: ['providers', providerId], value: profile }])
       wrote = true
       taken.add(providerId)
-      providers.push({ provider: providerId, baseURL: found.baseURL, action, changes, ...(skipped.length ? { skipped } : {}) })
+      providers.push({ provider: providerId, baseURL: found.baseURL, action, changes, modelCount, ...(skipped.length ? { skipped } : {}) })
     } catch (error) {
-      providers.push({ provider: providerId, baseURL: found.baseURL, action: 'failed', changes, error: msg(error) })
+      providers.push({ provider: providerId, baseURL: found.baseURL, action: 'failed', changes, modelCount, error: msg(error) })
     }
   }
 
@@ -964,7 +969,9 @@ async function selfCheck(ctx, config) {
   for (const result of withModels) {
     const providerId = existingByOrigin.get(result.origin)
     if (providerId === undefined) {
-      add(`link:${result.origin}`, 'warn', `${result.origin} 还没接进模型列表`,
+      // 标题里用 host:port 而不是完整 origin —— 面板第一块已经列过主机了，
+      // 这里再写一遍 http://… 就是同一句「IP 重复显示」的毛病。
+      add(`link:${result.origin}`, 'warn', `${result.host}:${result.port} 还没接进模型列表`,
         `点「接入本地模型」即可建出 provider；当前广告 ${result.models.length} 个模型`)
       continue
     }
@@ -1094,6 +1101,184 @@ function singleFlight(job) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// 面板视图：把两份报告压成「三个块 + 每行一个状态点」
+// ─────────────────────────────────────────────────────────────────────────
+//
+// 为什么这件排版的事放在**宿主侧**而不是页面脚本里：注入脚本是一整段字符串，Node 侧断言不了
+// 它渲染出什么；而排版恰好是用户反复提的东西（2026-09-24 连提三次：弹窗不消失、两个按钮重合、
+// 然后是「IP 重复显示 / 要绿点红点 / 排版统一 / 分几个块」）。放这里就能用普通单测钉住。
+//
+// 三个块各自回答一个问题，所以不合并：
+//   ① 接入检查 —— 有哪些端点、什么模型、多少上下文（发现的**事实**）
+//   ② 模型列表 —— 我把声明更新了吗（对 settings.yaml 的**动作**）
+//   ③ 自检     —— 现在还有哪里不对（声明与引擎的**判定**）
+//
+// 行的形状：{ level, key?, text, title? }
+//   level: 'ok' | 'warn' | 'fail' | 'neutral'（灰点）| 'host'（主机小标题，不打点）| 'detail'（灰字详情，缩进）
+//   key  : 有值时按固定宽度成列（端口 / provider 路由名）
+//   title: 完整原文，挂在 DOM 的 title 上 —— 屏幕上短，悬停不丢信息
+
+/** 连接层错误码 → 一**短**句人话。
+ *  刻意不带「主机通、端口没在听」这类解释：6 个端口里 5 个不通时，那句话会重复 5 遍 ——
+ *  和用户抱怨的「IP 重复显示」是同一种噪音。解释只在块尾出现一次（见 buildPanelView）。
+ *  原始报文进 row.title，所以一个字都没丢。 */
+export function shortUnreachable(target) {
+  switch (target?.code) {
+    case 'ECONNREFUSED': return '连接被拒'
+    case 'ETIMEDOUT': return '连接超时'
+    case 'EHOSTUNREACH':
+    case 'ENETUNREACH': return '主机 / 网络不可达'
+    case 'ENOTFOUND': return '主机名解析不了'
+    default: return '不通'
+  }
+}
+
+/** 只解释一次的那句（出现条件：确实有端口是 ECONNREFUSED）。 */
+const REFUSED_NOTE = '连接被拒 = 主机是通的，只是那个端口上没进程在听（服务没起，或正在启动 / 重启窗口里）'
+
+/** ISO → 本机时区的 `2026-09-25 02:19:31`（宿主与用户同一台机器，所以本地时间就是他要的）。 */
+export function formatStamp(iso) {
+  const date = new Date(asString(iso))
+  if (Number.isNaN(date.getTime())) return asString(iso)
+  const pad = (value) => String(value).padStart(2, '0')
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} `
+    + `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
+}
+
+/** 一条 change 的人话。 */
+function describeChange(change) {
+  const who = change?.id ? `${change.id} 的 ` : ''
+  return `${who}${change?.field}：${change?.from ?? '（空）'} → ${change?.to ?? '（空）'}`
+}
+
+const VERDICT_LEVEL = { ok: 'ok', warn: 'warn', fail: 'fail' }
+
+/**
+ * @param run - `POST /run` 的报告（可能带 error）
+ * @param check - `POST /selfcheck` 的报告（可能带 error）
+ * @returns `{ verdict, head, blocks }`，纯数据、可 JSON 化
+ */
+export function buildPanelView(run, check) {
+  const blocks = []
+
+  // ── ① 接入检查：同一台主机只写一次，端口成列 ──
+  const endpointRows = []
+  const targets = Array.isArray(run?.targets) ? run.targets : []
+  if (run?.error !== undefined) {
+    endpointRows.push({ level: 'fail', text: `探测失败：${run.error}` })
+  } else if (targets.length === 0) {
+    endpointRows.push({ level: 'neutral', text: '没有候选端点（检查 hosts / ports）' })
+  }
+  const byHost = new Map()
+  for (const target of targets) {
+    const host = asString(target?.host, '（未知主机）')
+    if (!byHost.has(host)) byHost.set(host, [])
+    byHost.get(host).push(target)
+  }
+  for (const [host, group] of byHost) {
+    endpointRows.push({ level: 'host', text: host })
+    for (const target of group) {
+      const key = String(target.port)
+      if (target.skipped !== undefined) {
+        endpointRows.push({ level: 'neutral', key, text: `跳过：${target.skipped}` })
+        continue
+      }
+      if (target.reachable !== true) {
+        endpointRows.push({ level: 'fail', key, text: shortUnreachable(target), title: target.error })
+        continue
+      }
+      const models = Array.isArray(target.models) ? target.models : []
+      if (models.length === 0) {
+        endpointRows.push({ level: 'warn', key, text: '通了，但没广告模型（可能在加载权重）' })
+        continue
+      }
+      const detail = models
+        .map((model) => `${model.id}${model.contextWindow ? ` @${model.contextWindow}` : ' @上下文未知'}`)
+        .join('，')
+      const engine = asString(target.engine) !== '' && target.engine !== 'unknown' ? `${target.engine} · ` : ''
+      endpointRows.push({
+        level: 'ok',
+        key,
+        text: `${engine}${detail}`,
+        title: `${host}:${target.port} · ${target.latencyMs ?? '?'}ms`
+      })
+    }
+  }
+  // 「连接被拒」的解释只说一次（否则 5 个不通的端口就重复 5 遍）。
+  if (targets.some((target) => target?.code === 'ECONNREFUSED')) {
+    endpointRows.push({ level: 'detail', text: REFUSED_NOTE })
+  }
+  blocks.push({ key: 'endpoints', title: '接入检查', rows: endpointRows })
+
+  // ── ② 模型列表：动作（新建 / 更新 / 已是最新 / 跳过 / 失败），末尾一行是写没写设置 ──
+  const modelRows = []
+  const providers = Array.isArray(run?.providers) ? run.providers : []
+  if (run?.error === undefined && providers.length === 0) {
+    modelRows.push({ level: 'neutral', text: '没有可接入的 provider' })
+  }
+  for (const entry of providers) {
+    const changes = Array.isArray(entry.changes) ? entry.changes : []
+    const detail = changes.map(describeChange).join('；')
+    const dropped = Array.isArray(entry.skipped) ? entry.skipped : []
+    const tail = dropped.length > 0 ? `，${dropped.length} 条未采纳` : ''
+    const droppedTitle = dropped.length > 0
+      ? `未采纳：${dropped.map((item) => `${item.id}（${item.reason}）`).join('；')}`
+      : ''
+    const title = [detail, droppedTitle].filter(Boolean).join('\\n')
+    const row = { key: entry.provider }
+    if (entry.action === 'failed') {
+      modelRows.push({ ...row, level: 'fail', text: '写设置失败', title: entry.error })
+    } else if (entry.action === 'skipped') {
+      modelRows.push({ ...row, level: 'warn', text: `跳过${tail}`, title: entry.error ?? droppedTitle })
+    } else if (entry.action === 'created') {
+      const added = changes.filter((change) => change.field === '(新增模型)').length
+      modelRows.push({ ...row, level: 'ok', text: `已接入（新建 ${added} 个模型）${tail}`, title })
+    } else if (entry.action === 'updated') {
+      modelRows.push({ ...row, level: 'ok', text: `已更新 ${changes.length} 处${tail}`, title })
+    } else if (entry.action === 'would-change') {
+      modelRows.push({ ...row, level: 'neutral', text: `待写入 ${changes.length} 处（dry-run）${tail}`, title })
+    } else if (entry.action === 'unchanged') {
+      const count = Number.isInteger(entry.modelCount) ? `（${entry.modelCount} 个模型）` : ''
+      modelRows.push({ ...row, level: 'ok', text: `已是最新${count}${tail}`, title })
+    } else {
+      modelRows.push({ ...row, level: 'warn', text: `未知状态 ${entry.action}${tail}`, title })
+    }
+  }
+  if (run !== null && run !== undefined && run.error === undefined) {
+    if (run.dryRun === true) modelRows.push({ level: 'neutral', text: 'dry-run：没有写入设置' })
+    else if (run.wrote === true) modelRows.push({ level: 'ok', text: '已写入设置（settings 热重载）' })
+    else modelRows.push({ level: 'neutral', text: '未写入设置（无需改动）' })
+  }
+  blocks.push({ key: 'models', title: '模型列表', rows: modelRows })
+
+  // ── ③ 自检：一行结论 + **只**列非 ok 的明细（全绿时不刷屏） ──
+  const checkRows = []
+  if (check?.error !== undefined) {
+    checkRows.push({ level: 'fail', text: `自检失败：${check.error}` })
+  } else {
+    const summary = check?.summary ?? {}
+    const verdict = asString(check?.verdict, 'unknown')
+    checkRows.push({
+      level: VERDICT_LEVEL[verdict] ?? 'neutral',
+      text: `${verdict.toUpperCase()} · ${summary.ok ?? 0} 通过 · ${summary.warn ?? 0} 提醒 · ${summary.fail ?? 0} 失败`,
+      title: `候选 ${summary.candidates ?? '?'} · 存活 ${summary.reachable ?? '?'} · 已接入 ${summary.linkedProviders ?? '?'}`
+    })
+    for (const item of Array.isArray(check?.checks) ? check.checks : []) {
+      if (item.level === 'ok') continue
+      checkRows.push({ level: item.level === 'fail' ? 'fail' : 'warn', text: item.title })
+      if (asString(item.detail) !== '') checkRows.push({ level: 'detail', text: item.detail })
+    }
+  }
+  blocks.push({ key: 'checks', title: '自检', rows: checkRows })
+
+  return {
+    verdict: asString(check?.verdict, run?.error !== undefined ? 'fail' : 'unknown'),
+    head: asString(run?.at) !== '' ? `检查于 ${formatStamp(run.at)}` : '',
+    blocks
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // 页面脚本（注入 index.html）
 // ─────────────────────────────────────────────────────────────────────────
 
@@ -1154,7 +1339,20 @@ const PANEL_STYLE = `
   color: var(--dsw-alias-label-primary); }
 #lmc-body { max-height: calc(42vh - 18px); overflow: auto; padding-right: 20px;
   font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 11px; line-height: 1.5;
-  white-space: pre-wrap; word-break: break-word; }
+  word-break: break-word; }
+/* 三个块（接入检查 / 模型列表 / 自检）：标题淡一档，块与块之间一条细线 + 间距。
+   块内每一行是 flex：状态点 + 定宽行首列 + 正文 —— 用 flex 而不是空格对齐，
+   因为正文会换行，空格对齐一换行就散了。 */
+#lmc-body .lmc-head { color: var(--dsw-alias-label-tertiary); margin-bottom: 6px; }
+#lmc-body .lmc-block + .lmc-block { margin-top: 9px; padding-top: 9px;
+  border-top: .5px solid var(--dsw-alias-border-l4); }
+#lmc-body .lmc-block-title { color: var(--dsw-alias-label-secondary); margin-bottom: 3px; }
+#lmc-body .lmc-row { display: flex; align-items: flex-start; gap: 6px; }
+#lmc-body .lmc-row .lmc-text { flex: 1; min-width: 0; white-space: pre-wrap; }
+#lmc-body .lmc-row .lmc-dot { margin-top: 5px; }
+#lmc-body .lmc-row .lmc-key { flex: none; width: 11ch; color: var(--dsw-alias-label-secondary); }
+#lmc-body .lmc-row.lmc-host { color: var(--dsw-alias-label-secondary); margin-top: 3px; }
+#lmc-body .lmc-row.lmc-detail { color: var(--dsw-alias-label-tertiary); padding-left: 12px; }
 `
 
 /**
@@ -1168,8 +1366,7 @@ function panelScript(autoHideMs) {
   const BODY_ID = 'lmc-body';
   const API = {
     state: ${JSON.stringify(ROUTE_STATE)},
-    run: ${JSON.stringify(ROUTE_RUN)},
-    selfcheck: ${JSON.stringify(ROUTE_SELFCHECK)}
+    panel: ${JSON.stringify(ROUTE_PANEL)}
   };
   const AUTO_HIDE_MS = ${Number(autoHideMs)};
 
@@ -1199,9 +1396,10 @@ function panelScript(autoHideMs) {
     box.style.top = Math.round(rect.bottom + 8) + 'px';
   }
 
-  function showBox(text) {
+  /** 渲染视图 → 显示弹窗 → 重置自动收起计时。 */
+  function showView(view, error) {
     if (box === null || body === null) return;
-    body.textContent = text;
+    renderView(view, error);
     box.classList.add('show');
     placeBox();
     clearTimeout(hideTimer);
@@ -1218,57 +1416,60 @@ function panelScript(autoHideMs) {
     return await response.json();
   }
 
-  /** 接入那半边的报告行。 */
-  function renderRunLines(report) {
-    if (!report) return ['没有返回'];
-    if (report.error) return ['出错了：' + report.error];
-    const lines = ['接入检查 @ ' + (report.at || '') + (report.dryRun ? '（dry-run，未写入）' : '')];
-    for (const t of report.targets || []) {
-      const at = (t.host || '?') + ':' + (t.port || '?');
-      if (t.skipped) { lines.push('· ' + at + ' 跳过：' + t.skipped); continue; }
-      if (!t.reachable) { lines.push('· ' + at + ' 不通：' + (t.error || '未知')); continue; }
-      const models = (t.models || []).map(function (m) {
-        return m.id + (m.contextWindow ? '@' + m.contextWindow : '@上下文未知');
-      }).join('，');
-      lines.push('· ' + at + ' [' + (t.engine || 'unknown') + '] ' + (models || '（没广告模型）'));
+  /**
+   * 一行 = 状态点 + 可选行首列 + 正文。
+   * 排版全部由 buildPanelView（宿主侧，可单测）决定，这里只负责把它变成 DOM；
+   * 屏幕上短，完整原文挂在 title 上，悬停不丢信息。
+   */
+  function makeRow(row) {
+    const line = document.createElement('div');
+    line.className = 'lmc-row lmc-' + (row.level || 'neutral');
+    if (row.level !== 'host' && row.level !== 'detail') {
+      const mark = document.createElement('span');
+      mark.className = 'lmc-dot ' + (row.level || 'neutral');
+      line.appendChild(mark);
     }
-    for (const p of report.providers || []) {
-      if (p.error) { lines.push('✗ ' + p.provider + '：' + p.error); continue; }
-      if (p.action === 'unchanged') { lines.push('= ' + p.provider + '：已是最新'); continue; }
-      if (p.action === 'would-change') { lines.push('~ ' + p.provider + '：待写入 ' + p.changes.length + ' 处'); continue; }
-      const c = (p.changes || []).map(function (x) {
-        return (x.id ? x.id + ' 的 ' : '') + x.field + ' ' + x.from + ' → ' + x.to;
-      }).join('；');
-      lines.push((p.action === 'created' ? '+ ' : '↑ ') + p.provider + '：' + (c || '无变化'));
+    if (row.key !== undefined && row.key !== null) {
+      const key = document.createElement('span');
+      key.className = 'lmc-key';
+      key.textContent = row.key;
+      line.appendChild(key);
     }
-    const dropped = [];
-    for (const p of report.providers || []) {
-      for (const s of p.skipped || []) dropped.push(p.provider + '/' + s.id + '（' + s.reason + '）');
-    }
-    if (dropped.length > 0) lines.push('未采纳：' + dropped.join('；'));
-    lines.push(report.wrote ? '已写入设置（settings 热重载）' : '未写入设置');
-    return lines;
+    const text = document.createElement('span');
+    text.className = 'lmc-text';
+    text.textContent = row.text;
+    line.appendChild(text);
+    if (row.title) line.title = row.title;
+    return line;
   }
 
-  /** 自检那半边的报告行：一行汇总 + **只**列非 ok 的明细（全 ok 时不刷屏）。 */
-  function renderCheckLines(report) {
-    if (!report) return ['自检：没有返回'];
-    if (report.error) return ['自检出错了：' + report.error];
-    const s = report.summary || {};
-    const icon = { warn: '!', fail: '✗' };
-    const lines = ['—— 自检 ' + String(report.verdict).toUpperCase() + '：' +
-      s.ok + ' 通过 · ' + s.warn + ' 提醒 · ' + s.fail + ' 失败'];
-    for (const c of report.checks || []) {
-      if (c.level === 'ok') continue;
-      lines.push((icon[c.level] || '·') + ' ' + c.title);
-      if (c.detail) lines.push('    ' + c.detail);
+  function renderView(view, error) {
+    if (body === null) return;
+    body.textContent = '';
+    if (error) {
+      body.appendChild(makeRow({ level: 'fail', text: '请求失败：' + error }));
+      return;
     }
-    return lines;
-  }
-
-  function renderReport(run, check) {
-    // 不再附「按哪里会收起」那行提示 —— 收起方式由右上角的叉自己说明（用户 2026-09-24 要求）。
-    return renderRunLines(run).concat(renderCheckLines(check)).join('\\n');
+    if (view === null || typeof view !== 'object') {
+      body.appendChild(makeRow({ level: 'fail', text: '没有拿到视图数据' }));
+      return;
+    }
+    if (view.head) {
+      const head = document.createElement('div');
+      head.className = 'lmc-head';
+      head.textContent = view.head;
+      body.appendChild(head);
+    }
+    for (const block of view.blocks || []) {
+      const section = document.createElement('div');
+      section.className = 'lmc-block';
+      const title = document.createElement('div');
+      title.className = 'lmc-block-title';
+      title.textContent = block.title;
+      section.appendChild(title);
+      for (const row of block.rows || []) section.appendChild(makeRow(row));
+      body.appendChild(section);
+    }
   }
 
   // ── 头部锚点：找「在本地打开」那条 slot 条目，插到它**最外层**前面 ──
@@ -1331,7 +1532,7 @@ function panelScript(autoHideMs) {
     try {
       await job();
     } catch (error) {
-      showBox('请求失败：' + (error && error.message ? error.message : String(error)));
+      showView(null, error && error.message ? error.message : String(error));
       setDot('fail');
     } finally {
       button.disabled = false;
@@ -1370,11 +1571,12 @@ function panelScript(autoHideMs) {
     runLabel = main.label;
     runButton.addEventListener('click', function () {
       invoke(runButton, runLabel, '接入中…', '接入本地模型', async function () {
-        // 顺序不能反：run 可能写设置，自检要反映**写完之后**的声明。
-        const run = await post(API.run);
-        const check = await post(API.selfcheck);
-        setDot(check && check.verdict);
-        showBox(renderReport(run, check));
+        // 一个请求拿回「三块视图」；run 与 selfcheck 都在宿主侧按正确顺序跑完了
+        // （run 可能写设置，自检要反映**写完之后**的声明）。
+        const payload = await post(API.panel);
+        const view = payload && payload.view ? payload.view : null;
+        setDot(view ? view.verdict : 'fail');
+        showView(view, payload && payload.error);
       });
     });
 
@@ -1452,7 +1654,7 @@ function sendJson(res, status, payload) {
   res.end(body)
 }
 
-export { runConnect, selfCheck, ROUTE_STATE, ROUTE_RUN, ROUTE_SELFCHECK, LEGACY_ROUTE_RUN, VERSION }
+export { runConnect, selfCheck, ROUTE_STATE, ROUTE_RUN, ROUTE_SELFCHECK, ROUTE_PANEL, LEGACY_ROUTE_RUN, VERSION }
 
 export function apply(ctx, pluginConfig) {
   const config = resolveConfig(pluginConfig)
@@ -1518,6 +1720,21 @@ export function apply(ctx, pluginConfig) {
     path: ROUTE_SELFCHECK,
     handler: guard(async () => await singleFlight(() => selfCheck(ctx, config)))
   }), 'local-models-connect: selfcheck route')
+
+  // 面板那一个按钮打的就是这条路：一次请求拿回「三块视图」。
+  // 顺序不能反 —— run 可能写设置，自检要反映**写完之后**的声明。
+  ctx.effect(() => ctx.webServer.register({
+    kind: 'exact',
+    path: ROUTE_PANEL,
+    handler: guard(async (req) => {
+      if (req.method !== 'POST') throw new Error(`${ROUTE_PANEL} 只接受 POST`)
+      return await singleFlight(async () => {
+        const run = await runConnect(ctx, config, { dryRun: false })
+        const check = await selfCheck(ctx, config)
+        return { ok: run.ok !== false, at: new Date().toISOString(), view: buildPanelView(run, check) }
+      })
+    })
+  }), 'local-models-connect: panel route')
 
   ctx.on('webserver/index-inject', (table) => injectPanel(table, config))
 

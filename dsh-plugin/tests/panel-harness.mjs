@@ -20,7 +20,7 @@ import http from 'node:http'
 import { writeFileSync } from 'node:fs'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
-const MODULE = process.argv[2] ?? fileURLToPath(new URL('../local-models-connect.v6.mjs', import.meta.url))
+const MODULE = process.argv[2] ?? fileURLToPath(new URL('../local-models-connect.v7.mjs', import.meta.url))
 const AUTO_HIDE_MS = Number(process.argv[3] ?? 9000)
 const PORT = Number(process.argv[4] ?? 18181)
 const plugin = await import(pathToFileURL(MODULE).href)
@@ -50,6 +50,8 @@ const TOKENS = `
   --dsw-alias-label-primary: #1c1c1e;
   --dsw-alias-label-secondary: #6b7280;
   --dsw-alias-label-dimmed: #b0b0b5;
+  /* 浅色档：--dsw-alias-label-tertiary: var(--dsw-static-neutral-bluish-600) */
+  --dsw-alias-label-tertiary: #81858c;
   --dsw-alias-interactive-bg-hover: #2631480f;
   --dsw-alias-bg-layer-3: #ffffff;
   --dsw-alias-state-success-primary: #22c55e;
@@ -100,18 +102,21 @@ const SELFCHECK = {
   checks: [
     { id: 'plugin', level: 'ok', title: '插件已加载 v1.4.0', detail: 'x' },
     { id: 'targets', level: 'ok', title: '候选端点 6 个，存活 1 个', detail: 'x' },
-    { id: 'warn-a', level: 'warn', title: 'http://192.168.0.119:8000 还没接进模型列表', detail: '点「接入本地模型」即可建出 provider' },
+    { id: 'warn-a', level: 'warn', title: '192.168.0.119:8000 还没接进模型列表', detail: '点「接入本地模型」即可建出 provider' },
     { id: 'warn-b', level: 'warn', title: 'x/y 的压缩阈值不够塞', detail: '把 maxTokens 降到 30000 或更小' }
   ],
   targets: []
 }
 const RUN = {
-  ok: true, at: '2026-09-24T00:49:00.000Z', version: '1.4.0', dryRun: false, wrote: true,
+  ok: true, at: '2026-09-24T18:19:31.615Z', dryRun: false, wrote: false,
   candidates: ['192.168.0.119:8080'], targets: [
     { baseURL: 'http://192.168.0.119:8080/v1', origin: 'http://192.168.0.119:8080', host: '192.168.0.119', port: 8080, reachable: true, status: 200, latencyMs: 9, engine: 'vllm', models: [{ id: 'Qwen3.8-27B-Q6-dual-5060ti', name: 'x', contextWindow: 150000 }] },
-    { baseURL: 'http://192.168.0.119:8000/v1', origin: 'http://192.168.0.119:8000', host: '192.168.0.119', port: 8000, reachable: false, code: 'ECONNREFUSED', error: 'ECONNREFUSED：connect ECONNREFUSED 192.168.0.119:8000' }
+    ...[8000, 30000, 8081, 11434, 1234].map((port) => ({
+      baseURL: `http://192.168.0.119:${port}/v1`, origin: `http://192.168.0.119:${port}`, host: '192.168.0.119', port,
+      reachable: false, code: 'ECONNREFUSED', error: `ECONNREFUSED：connect ECONNREFUSED 192.168.0.119:${port}`
+    }))
   ],
-  providers: [{ provider: 'qwen-local', baseURL: 'http://192.168.0.119:8080/v1', action: 'created', changes: [{ field: 'baseURL', from: null, to: 'http://192.168.0.119:8080/v1' }, { id: 'Qwen3.8-27B-Q6-dual-5060ti', field: '(新增模型)', from: null, to: 150000 }], skipped: [{ id: 'mystery', reason: '引擎没报上下文长度' }] }]
+  providers: [{ provider: 'qwen-local', baseURL: 'http://192.168.0.119:8080/v1', action: 'unchanged', changes: [], modelCount: 1 }]
 }
 
 const hits = []
@@ -123,7 +128,11 @@ const server = http.createServer((req, res) => {
     res.end(JSON.stringify(body))
   }
   if (path === '/local-models-connect/state') {
-    return send({ ok: true, version: '1.4.0', config: {}, lastRun: null, lastSelfCheck: { verdict: 'ok', at: '2026-09-24T00:45:00.000Z' } })
+    return send({ ok: true, version: '1.6.0', config: {}, lastRun: null, lastSelfCheck: { verdict: 'ok', at: '2026-09-24T00:45:00.000Z' } })
+  }
+  if (path === '/local-models-connect/panel') {
+    // 用**真插件**的视图构造器，所以这里验的就是要上线的那份排版
+    return send({ ok: true, at: RUN.at, view: plugin.buildPanelView(RUN, SELFCHECK) })
   }
   if (path === '/local-models-connect/selfcheck') return send(SELFCHECK)
   if (path === '/local-models-connect/run') return send(RUN)

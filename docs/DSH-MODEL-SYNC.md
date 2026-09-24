@@ -39,11 +39,11 @@ models:
 
 ## 3. 新一代：`local-models-connect.v1`
 
-源码：[`../dsh-plugin/local-models-connect.v6.mjs`](../dsh-plugin/local-models-connect.v6.mjs)
-测试：[`../dsh-plugin/tests/local-models-connect.test.mjs`](../dsh-plugin/tests/local-models-connect.test.mjs)（65 条，`node dsh-plugin/tests/local-models-connect.test.mjs`）
+源码：[`../dsh-plugin/local-models-connect.v7.mjs`](../dsh-plugin/local-models-connect.v7.mjs)
+测试：[`../dsh-plugin/tests/local-models-connect.test.mjs`](../dsh-plugin/tests/local-models-connect.test.mjs)（81 条，`node dsh-plugin/tests/local-models-connect.test.mjs`）
 面板验证台：[`../dsh-plugin/tests/panel-harness.mjs`](../dsh-plugin/tests/panel-harness.mjs)（起一个仿真的会话头部 + 桩路由，供真浏览器驱动；真 GUI 要 token，而凭据不进 agent 命令）
 
-装到 `~/.dsh/plugins/local-models-connect.v6.mjs`，并在
+装到 `~/.dsh/plugins/local-models-connect.v7.mjs`，并在
 `~/.dsh/profiles/web/cordis.patch.yml` 里挂一条（见 §6）。**它取代了 `local-models-sync.v1`**。
 
 它做三件事：
@@ -123,6 +123,7 @@ models:
 | `GET` | `/local-models-connect/state` | 插件配置 + 最近一次的报告缓存，**不打网络** |
 | `POST` | `/local-models-connect/run` | 发现 + 接入；加 `?dry=1` 只看不写 |
 | `GET`/`POST` | `/local-models-connect/selfcheck` | 只读自检 |
+| `POST` | `/local-models-connect/panel` | **面板用的那一条**：run + selfcheck 跑完，直接回"三个块"的视图（见 §4.1） |
 | `POST` | `/local-models-sync/run` | **v1 的旧路径留作别名**，行为同 `run` |
 
 ```bash
@@ -135,24 +136,56 @@ curl -sS http://127.0.0.1:3080/local-models-connect/selfcheck | python3 -m json.
 （拿不到头部时退回右下角浮动，按钮不会凭空消失）：
 
 * **一次点击 = 接入 + 自检，报告合一**。原来「接入本地模型」与「自检」是两个按钮：它们探的是
-  同一批端点、走的是同一段探测代码，功能明显重合（2026-09-24 用户点出来的）。现在点一下先
-  `POST /run`（发现 + 写声明）再 `POST /selfcheck`（只读判定），报告是**一段**：
-  上半接入结果（每个候选端点一行 + 每个 provider 一行 + 未采纳 + 是否写入），
-  下半自检结论（一行汇总 + **只列非 ok 的明细**，全绿时不刷屏）。顺序不能反 —— 自检要反映
-  **写完之后**的声明。
-  只读能力没有消失，只是不再占一个按钮：CLI 的 `GET /selfcheck`、`?dry=1`、
-  `config.autoApply:false` 都还在，开机自动探测也仍旧跑。
+  同一批端点、走的是同一段探测代码，功能明显重合（2026-09-24 用户点出来的）。现在点一下打
+  **一个** `POST /panel`（宿主侧先 run 再 selfcheck，顺序不能反 —— 自检要反映**写完之后**的声明），
+  回一份排好版的视图。只读能力没有消失，只是不再占一个按钮：CLI 的 `GET /selfcheck`、
+  `?dry=1`、`config.autoApply:false` 都还在，开机自动探测也仍旧跑。
 * 按钮带一个状态点（最近一次自检的 verdict：绿/黄/红）。
 * 度量照抄 `dsh-client-ui-open-in-app` 的 28px 高 / 14px 圆角 / `.5px` `border-l4` /
   11px·16px 字 / 同 padding，并复用同一批 `--dsw-alias-*` 令牌 —— 深浅色主题、hover、
   disabled 都跟着 DSH 走。
 * 报告弹窗是 `position: fixed`（**不参与布局、不顶开页面**）。收起方式：**右上角的叉**、
-  再点按钮、按 Esc、滚页面、超时（`autoHideMs`，默认 12 秒）。
+  按 Esc、滚页面、超时（`autoHideMs`，默认 12 秒）。
   **整块弹窗不可点**（`cursor` 是 `auto`，不是 `pointer`）—— 早先它自己就是关闭热区，
   于是报告末尾还得附一行「点这里…」的说明，看着像个大按钮（2026-09-24 用户要求换掉）。
   叉是 22×22 的绝对定位按钮（`top/right: 4px`），挂在 `#lmc-box` 上；
   可滚动的正文是**另一个元素** `#lmc-body`，否则叉会跟着正文一起滚走。
   旧版把报告留在文档流里，点一次就永久占一块地方 —— 也是 2026-09-24 点名要改的。
+
+### 4.1 报告排版：三个块、一根状态点、主机只写一次
+
+用户 2026-09-24 的第二轮反馈是纯排版：「IP 怎么重复显示 / 通不通要用绿点红点 / 排版统一 /
+是不是该分三个块」。于是把排版从页面脚本里**搬到宿主侧**（`buildPanelView`，纯函数）——
+注入脚本是一整段字符串，Node 侧断言不了它渲染出什么，而排版恰恰是反复被提的东西。
+
+三个块各回答一个问题，所以不合并：
+
+```
+检查于 2026-09-25 02:35:41
+【接入检查】            ← 有哪些端点、什么模型、多少上下文（发现的**事实**）
+  192.168.0.119         ← 主机只写一次（旧版每行都重复 192.168.0.119:xxxx）
+  ● 8080   vllm · Qwen3.8-27B-Q6-dual-5060ti @150000     ← 绿点
+  ● 8000   连接被拒                                      ← 红点
+  ● 30000  连接被拒
+  连接被拒 = 主机是通的，只是那个端口上没进程在听（服务没起，或正在启动 / 重启窗口里）
+                        ← 这句解释只说一次，不是每个端口重复一遍
+【模型列表】            ← 我把声明更新了吗（对 settings.yaml 的**动作**）
+  ● qwen-local  已是最新（1 个模型）
+  ● 未写入设置（无需改动）
+【自检】                ← 现在还有哪里不对（声明与引擎的**判定**）
+  ● OK · 6 通过 · 0 提醒 · 0 失败
+```
+
+* **行 = 状态点 + 定宽行首列 + 正文**：绿 `ok` / 黄 `warn` / 红 `fail` / 灰 `neutral`（跳过、
+  无改动、dry-run）；`host` 与 `detail` 两种行不打点，分别是淡色的主机小标题与缩进 12px 的注解。
+  颜色用 `--dsw-alias-state-*-primary`，跟随主题。
+* 对齐靠 **flex**（`.lmc-key` 定宽 + 正文 `flex:1`），不靠空格 —— 正文一换行，空格对齐就散。
+* 屏幕上短、**悬停不丢信息**：每一行的完整原文（连接层原始报文、change 的逐条 diff、
+  未采纳原因、自检 detail）都挂在 DOM 的 `title` 上。
+* 「没变化」不再写成光秃秃的「未写入设置」，而是「未写入设置（无需改动）」——
+  它和「dry-run 没写」是两回事，早先那句含糊话已经被问过一次。
+* 纯函数 ⇒ 可用普通单测钉住（`81 条` 里有 15 条专门测排版：主机只出现一次、点的颜色、
+  解释只说一次、各 action 的文案、出错也成块）。
 
 样式走独立的 `style` 注入行、脚本走 `script` 行（v1 把 CSS 塞在模板字符串里，改一个颜色
 都要数反斜杠）。页面加载时只读 `/state` 的缓存，不打网络。
@@ -215,7 +248,7 @@ v1 只强制引擎**广告出来的事实**（`contextWindow` / `maxTokens` 上�
 ```yaml
 - insert:
     - id: local-models-connect
-      name: "/home/lcy/.dsh/plugins/local-models-connect.v6.mjs"
+      name: "/home/lcy/.dsh/plugins/local-models-connect.v7.mjs"
       config:
         hosts: ['192.168.0.119']          # 种子主机：唯一的扫描范围，要加机器改这一行
         ports: [8080, 8000, 30000, 8081, 11434, 1234]
@@ -271,7 +304,7 @@ curl -sS http://127.0.0.1:3080/local-models-connect/state | python3 -m json.tool
 ```bash
 cp ~/.dsh/profiles/web/cordis.patch.yml.bak-before-local-models-connect-<ts> \
    ~/.dsh/profiles/web/cordis.patch.yml
-rm ~/.dsh/plugins/local-models-connect.v6.mjs
+rm ~/.dsh/plugins/local-models-connect.v7.mjs
 ```
 
 `settings.yaml` 的写入是幂等的（值没变就不写），回滚插件不会把设置改回去。
@@ -321,7 +354,7 @@ Cordis 只在 `name`（也就是文件路径）变化时才重新 `import` 模�
   （`接入本地模型`、`__localModelsConnectInstalled`），且注入脚本里没有提前闭合的 `</script>`；
 * `POST /run?dry=1` → `wrote: false`，一个字节都没写。
 
-回归测试 65 条全过（纯逻辑 39 + 假引擎探测 5 + 端到端 18 + 面板契约 1 + 实机冒烟 1 —— 数出来的
+回归测试 81 条全过（纯逻辑 39 + 假引擎探测 6 + 端到端 19 + 面板排版 16 + 实机冒烟 1 —— 数出来的
 是这样，不是估的）。真机 192.168.0.119:8080 冒烟：识别为 `vllm`，`Qwen3.8-27B-Q6-dual-5060ti`，
 上下文 150000，KV 池 157,824（= 文档里那个数，见下面「一次误判」）。
 
@@ -361,12 +394,30 @@ v5（单按钮版）：
 * 把 `#lmc-tools` 从 DOM 里删掉 → MutationObserver 300ms 后重挂，且**不重复**（1 个实例）；
 * 0 条 console 错误。
 
-**红绿对照（这次的 0px bug）**：把 HEAD 里那一版 v4 交给同一个验证台跑 ——
+**红绿对照（0px 那个 bug）**：把 HEAD 里那一版 v4 交给同一个验证台跑 ——
 `tools.parentElement` 是包裹层 `Ss22bb_entry`（不是容器），`gapToSplitPx` **0**，两个按钮；
 换成 v5 后 `directChildOfContainer: true`、`gapRightPx/gapLeftPx` 都是 **8**，一个按钮。
 用户报的现象与红侧完全一致，所以这个验证台是能抓住它的，不是"跑了个寂寞"。
 
-**上一次修掉的一个真 bug**：弹窗原本用 `max-width` + shrink-to-fit，于是「可用宽度」会被上一次
+### v7 的排版实测（2026-09-25，真浏览器）
+
+同一个验证台（桩路由现在直接用**真插件**的 `buildPanelView`，所以验的就是要上线的那份排版）：
+
+* 块标题依次 `接入检查 / 模型列表 / 自检`，块间是 `border-top: .5px`（渲染 1px）+ 9px 间距；
+* `hostRowHasDot: false`、主机行文本就是 `192.168.0.119`；
+* 6 个端口行：可达那行 `rgb(34,197,94)`（绿）、5 个被拒的行 `rgb(239,68,68)`（红）——
+  就是用户要的「通的绿点、不通的红点」；
+* `keyColumnAligned: true`：6 行的正文左缘都是 **924px**，端口成列（旧版没有列，靠空格自然对不齐）；
+* 三级文字色真的分开了：主机行 `rgb(107,114,128)`（label-secondary）、
+  `detail` 注脚 `rgb(129,133,140)`（label-tertiary）、普通行 `rgb(28,28,30)`（label-primary）；
+  `detail` 行缩进 **12px**（`detailRowLeft 833` vs `detailTextLeft 845`）；
+* 「连接被拒」的解释在整块里只出现 **1 次**（`notes.length === 1`），端口行只留短标签；
+* 自检块：结论行 + 只列非 ok 的明细，detail 各占一行且同样淡色缩进；
+* 叉仍然关得掉（`closedByX: true`），动态渲染后 **0 条 console 错误**。
+
+真机 `POST /panel` 的返回与上面逐字一致（见 §9 开头那三段 `【…】`）。
+
+**上一批修掉的一个真 bug**：弹窗原本用 `max-width` + shrink-to-fit，于是「可用宽度」会被上一次
 写下的 `left` 截断 —— 量到的是「剩下的空间」而不是内容宽度，每次重排都把弹窗再往左推一截
 （实测右边缘差了 **59px**）。改成 CSS 里写死 `width: min(72vw, 560px)` + `box-sizing: border-box`
 后，`offsetWidth` 与 `left` 无关，重复展示两次的 `left` 完全相同（821px = 1381 − 560）。

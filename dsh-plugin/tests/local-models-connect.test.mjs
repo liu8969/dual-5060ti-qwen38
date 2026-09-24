@@ -6,13 +6,13 @@
  *   4. 实机冒烟：真打 192.168.0.119:8080（不在线只记 warn，不算失败）。
  *
  * 跑法：node dsh-plugin/tests/local-models-connect.test.mjs [插件路径]
- *       （不给路径就测同仓库的 ../local-models-connect.v6.mjs）
+ *       （不给路径就测同仓库的 ../local-models-connect.v7.mjs）
  */
 import assert from 'node:assert/strict'
 import http from 'node:http'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
-const MODULE_PATH = process.argv[2] ?? fileURLToPath(new URL('../local-models-connect.v6.mjs', import.meta.url))
+const MODULE_PATH = process.argv[2] ?? fileURLToPath(new URL('../local-models-connect.v7.mjs', import.meta.url))
 const plugin = await import(pathToFileURL(MODULE_PATH).href)
 
 let pass = 0
@@ -551,11 +551,11 @@ await ta('probeTarget：列表结构不对 → reachable 但带读不动的 erro
 
 section('3. 端到端')
 
-await ta('apply：注册 4 条路由，注入 style + script 两行，且启动日志有版本号', async () => {
+await ta('apply：注册 5 条路由，注入 style + script 两行，且启动日志有版本号', async () => {
   const host = makeHost()
   plugin.apply(host.ctx, { autoProbe: false })
   assert.deepEqual([...host.routes.keys()].sort(),
-    [plugin.ROUTE_RUN, plugin.ROUTE_SELFCHECK, plugin.ROUTE_STATE, plugin.LEGACY_ROUTE_RUN].sort())
+    [plugin.ROUTE_RUN, plugin.ROUTE_SELFCHECK, plugin.ROUTE_STATE, plugin.ROUTE_PANEL, plugin.LEGACY_ROUTE_RUN].sort())
   const table = []
   for (const inject of host.injects) if (inject.event === 'webserver/index-inject') inject.fn(table)
   assert.equal(table.length, 2)
@@ -632,15 +632,14 @@ await ta('面板：单按钮挂到「在本地打开」左边且间距取容器 
   assert.match(script, /tools\.appendChild\(runButton\)/)
   assert.doesNotMatch(script, /checkButton|checkLabel/)
 
-  // ④ 一次点击 = 接入 + 自检，报告合一；顺序不能反（自检要反映写完之后的状态）
-  const runAt = script.indexOf('post(API.run)')
-  const checkAt = script.indexOf('post(API.selfcheck)')
-  assert.ok(runAt > 0 && checkAt > runAt, '先 run 后 selfcheck')
-  assert.match(script, /showBox\(renderReport\(run, check\)\)/, '两份报告合成一次渲染')
-  assert.match(script, /function renderRunLines/, '接入那半边')
-  assert.match(script, /function renderCheckLines/, '自检那半边')
-  assert.match(script, /function renderReport\(run, check\)/)
-  assert.match(script, /if \(c\.level === 'ok'\) continue;/, '自检只列非 ok 的明细，不全量刷屏')
+  // ④ 一次点击 = 一个请求（面板路由），排版在宿主侧算好；客户端只把 view 变成 DOM
+  assert.ok(script.includes(`panel: ${JSON.stringify(plugin.ROUTE_PANEL)}`), '注入的是解析好的面板路径')
+  assert.doesNotMatch(script, /API\.run|API\.selfcheck/, '不再分两次请求')
+  assert.match(script, /const payload = await post\(API\.panel\);/)
+  assert.match(script, /showView\(view, payload && payload\.error\)/)
+  assert.match(script, /function renderView\(view, error\)/, '客户端只负责渲染视图')
+  assert.match(script, /function makeRow\(row\)/, '一行 = 点 + 行首列 + 正文')
+  assert.doesNotMatch(script, /renderRunLines|renderCheckLines|renderReport/, '旧的纯文本拼装已删')
 
   // ⑤ 锚点：限定在头部容器内、并爬到容器的**直接子项**（容器的 gap 才作用得到）
   assert.match(script, /_headerUtilities/, '先找头部容器')
@@ -976,10 +975,204 @@ await ta('端到端：全新环境建出的 provider 不挂任何凭据名', asy
 })
 
 // ─────────────────────────────────────────────────────────────────────────
-// 4. 实机冒烟
+// 4. 面板视图（排版）—— 用户反复提的就是这块，所以钉在这里
 // ─────────────────────────────────────────────────────────────────────────
 
-section('4. 实机冒烟（192.168.0.119:8080）')
+section('4. 面板视图（排版）')
+
+const HOST = '192.168.0.119'
+const panelTarget = (port, over = {}) => ({
+  host: HOST, port, baseURL: `http://${HOST}:${port}/v1`, origin: `http://${HOST}:${port}`, ...over
+})
+const upTarget = (port = 8080) => panelTarget(port, {
+  reachable: true, status: 200, latencyMs: 10, engine: 'vllm',
+  models: [{ id: 'Qwen3.8-27B-Q6-dual-5060ti', name: 'x', contextWindow: 150000 }]
+})
+const refusedTarget = (port) => panelTarget(port, {
+  reachable: false, status: null, code: 'ECONNREFUSED',
+  error: `ECONNREFUSED：connect ECONNREFUSED ${HOST}:${port}`
+})
+const panelRun = (over = {}) => ({
+  ok: true, at: '2026-09-24T18:19:31.615Z', dryRun: false, wrote: false,
+  targets: [upTarget(8080), refusedTarget(8000), refusedTarget(30000)],
+  providers: [{ provider: 'qwen-local', baseURL: `http://${HOST}:8080/v1`, action: 'unchanged', changes: [], modelCount: 1 }],
+  ...over
+})
+const panelCheck = (over = {}) => ({
+  ok: true, verdict: 'ok',
+  summary: { candidates: 3, reachable: 1, withModels: 1, models: 1, linkedProviders: 1, pendingEndpoints: 0, ok: 6, warn: 0, fail: 0 },
+  checks: [
+    { id: 'plugin', level: 'ok', title: '插件已加载' },
+    { id: 'warn-a', level: 'warn', title: '端口 8000 还没接进模型列表', detail: '点一下即可建出 provider' }
+  ],
+  ...over
+})
+const rowsOf = (view, key) => view.blocks.find((block) => block.key === key).rows
+const textsOf = (view) => view.blocks.flatMap((block) => block.rows.map((row) => row.text))
+
+t('视图：三个块，标题与顺序固定（接入检查 / 模型列表 / 自检）', () => {
+  const view = plugin.buildPanelView(panelRun(), panelCheck())
+  assert.deepEqual(view.blocks.map((block) => block.title), ['接入检查', '模型列表', '自检'])
+})
+
+t('视图：同一台主机只写一次 —— 不再每行重复 IPv4', () => {
+  const view = plugin.buildPanelView(panelRun(), panelCheck())
+  const texts = textsOf(view)
+  const hits = texts.join(' ').match(new RegExp(HOST.replace(/\./g, '\\.'), 'g')) || []
+  assert.equal(hits.length, 1, '全视图里主机只出现一次')
+  const hostRows = rowsOf(view, 'endpoints').filter((row) => row.level === 'host')
+  assert.deepEqual(hostRows.map((row) => row.text), [HOST], '那一次就是 host 行')
+  // 端口行里不该再夹带 IP（旧版每行都是 192.168.0.119:8000 这样）
+  for (const row of rowsOf(view, 'endpoints')) {
+    if (row.level === 'host') continue
+    assert.ok(!row.text.includes(HOST), `端口行「${row.text}」不该再带主机`)
+  }
+})
+
+t('视图：可达 = ok 点、被拒 = fail 点，端口在行首列（key）', () => {
+  const rows = rowsOf(plugin.buildPanelView(panelRun(), panelCheck()), 'endpoints')
+  assert.deepEqual(rows.find((row) => row.key === '8080').level, 'ok')
+  assert.deepEqual(rows.find((row) => row.key === '8000').level, 'fail')
+  assert.equal(rows.find((row) => row.key === '8080').text, 'vllm · Qwen3.8-27B-Q6-dual-5060ti @150000')
+  assert.equal(rows.find((row) => row.key === '8000').text, '连接被拒')
+})
+
+t('视图：「连接被拒」的解释只说一次（不是每个端口重复一遍）', () => {
+  const rows = rowsOf(plugin.buildPanelView(panelRun(), panelCheck()), 'endpoints')
+  const notes = rows.filter((row) => row.level === 'detail' && row.text.includes('连接被拒 = '))
+  assert.equal(notes.length, 1)
+  assert.equal(rows.filter((row) => row.text === '连接被拒').length, 2, '端口行只留短标签')
+})
+
+t('视图：可达但没广告模型 → warn；skipped → neutral 且带原因', () => {
+  const run = panelRun({
+    targets: [panelTarget(8080, { reachable: true, engine: 'vllm', models: [] }),
+      panelTarget(9000, { skipped: '不是内网端点（allowPublic=false）' })]
+  })
+  const rows = rowsOf(plugin.buildPanelView(run, panelCheck()), 'endpoints')
+  assert.equal(rows.find((row) => row.key === '8080').level, 'warn')
+  assert.equal(rows.find((row) => row.key === '9000').level, 'neutral')
+  assert.match(rows.find((row) => row.key === '9000').text, /跳过/)
+})
+
+t('视图：多台主机 → 各自一个 host 行', () => {
+  const run = panelRun({ targets: [upTarget(8080), panelTarget(8080, { host: '127.0.0.1', reachable: true, engine: 'vllm', models: [{ id: 'm', contextWindow: 4096 }] })] })
+  const hosts = rowsOf(plugin.buildPanelView(run, panelCheck()), 'endpoints').filter((row) => row.level === 'host')
+  assert.deepEqual(hosts.map((row) => row.text), ['192.168.0.119', '127.0.0.1'])
+})
+
+t('视图：provider 各种 action 都有人话 + 状态点', () => {
+  const cases = [
+    [{ action: 'unchanged', changes: [], modelCount: 1 }, 'ok', /已是最新（1 个模型）/],
+    [{ action: 'created', changes: [{ id: 'm', field: '(新增模型)', from: null, to: 150000 }], modelCount: 1 }, 'ok', /已接入（新建 1 个模型）/],
+    [{ action: 'updated', changes: [{ id: 'm', field: 'contextWindow', from: 100, to: 150000 }], modelCount: 1 }, 'ok', /已更新 1 处/],
+    [{ action: 'would-change', changes: [{ field: 'baseURL', from: null, to: 'x' }], modelCount: 1 }, 'neutral', /dry-run/],
+    [{ action: 'skipped', changes: [], modelCount: 0, error: '上下文都读不到' }, 'warn', /跳过/],
+    [{ action: 'failed', changes: [], modelCount: 1, error: '写设置失败：boom' }, 'fail', /写设置失败/]
+  ]
+  for (const [provider, level, pattern] of cases) {
+    const rows = rowsOf(plugin.buildPanelView(panelRun({ providers: [{ provider: 'qwen-local', ...provider }] }), panelCheck()), 'models')
+    const row = rows.find((item) => item.key === 'qwen-local')
+    assert.equal(row.level, level, `${provider.action} 的等级`)
+    assert.match(row.text, pattern, `${provider.action} 的文案`)
+  }
+})
+
+t('视图：写没写设置也有一行，且「没变」不等于「没写入」', () => {
+  const unchanged = rowsOf(plugin.buildPanelView(panelRun({ wrote: false, dryRun: false }), panelCheck()), 'models')
+  assert.equal(unchanged.at(-1).level, 'neutral')
+  assert.match(unchanged.at(-1).text, /未写入设置（无需改动）/)
+  const wrote = rowsOf(plugin.buildPanelView(panelRun({ wrote: true }), panelCheck()), 'models')
+  assert.equal(wrote.at(-1).level, 'ok')
+  assert.match(wrote.at(-1).text, /已写入设置/)
+  const dry = rowsOf(plugin.buildPanelView(panelRun({ dryRun: true }), panelCheck()), 'models')
+  assert.match(dry.at(-1).text, /dry-run/)
+})
+
+t('视图：自检块 —— 结论一行、ok 明细滤掉、非 ok 带 detail 行', () => {
+  const rows = rowsOf(plugin.buildPanelView(panelRun(), panelCheck()), 'checks')
+  assert.equal(rows[0].level, 'ok')
+  assert.match(rows[0].text, /^OK · 6 通过 · 0 提醒 · 0 失败$/)
+  assert.ok(!rows.some((row) => row.text === '插件已加载'), 'ok 的明细不列')
+  assert.equal(rows[1].level, 'warn')
+  assert.equal(rows[2].level, 'detail')
+  assert.match(rows[2].text, /点一下即可建出 provider/)
+})
+
+t('视图：自检 verdict 决定结论行的颜色（fail 红 / warn 黄）', () => {
+  const warn = rowsOf(plugin.buildPanelView(panelRun(), panelCheck({ verdict: 'warn', summary: { ok: 5, warn: 1, fail: 0 } })), 'checks')
+  assert.equal(warn[0].level, 'warn')
+  const fail = rowsOf(plugin.buildPanelView(panelRun(), panelCheck({ verdict: 'fail', summary: { ok: 5, warn: 0, fail: 1 } })), 'checks')
+  assert.equal(fail[0].level, 'fail')
+})
+
+t('视图：出错也成块 —— run 报错进第一块，check 报错进第三块', () => {
+  const broken = plugin.buildPanelView({ error: '端点全挂' }, { error: '自检炸了' })
+  assert.deepEqual(broken.blocks.map((block) => block.title), ['接入检查', '模型列表', '自检'])
+  assert.equal(rowsOf(broken, 'endpoints')[0].level, 'fail')
+  assert.match(rowsOf(broken, 'endpoints')[0].text, /端点全挂/)
+  assert.equal(rowsOf(broken, 'checks')[0].level, 'fail')
+  assert.match(rowsOf(broken, 'checks')[0].text, /自检炸了/)
+  assert.equal(broken.verdict, 'fail')
+})
+
+t('视图：没有候选端点 / 没有 provider 时给灰点说明，而不是空白块', () => {
+  const view = plugin.buildPanelView({ ok: true, at: 'x', targets: [], providers: [], wrote: false }, panelCheck())
+  assert.equal(rowsOf(view, 'endpoints')[0].level, 'neutral')
+  assert.match(rowsOf(view, 'endpoints')[0].text, /没有候选端点/)
+  assert.equal(rowsOf(view, 'models')[0].level, 'neutral')
+  assert.match(rowsOf(view, 'models')[0].text, /没有可接入的 provider/)
+})
+
+t('视图：整份可 JSON 化（要过 HTTP）', () => {
+  const view = plugin.buildPanelView(panelRun(), panelCheck())
+  assert.doesNotThrow(() => JSON.parse(JSON.stringify(view)))
+})
+
+t('视图：时间戳是本机时区的可读形式，不是 ISO', () => {
+  const view = plugin.buildPanelView(panelRun({ at: '2026-09-24T18:19:31.615Z' }), panelCheck())
+  assert.match(view.head, /^检查于 \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/)
+  assert.ok(!view.head.includes('T') && !view.head.includes('Z'))
+})
+
+t('shortUnreachable：各连接层错误码都有人话，原始报文不丢（进 title）', () => {
+  assert.equal(plugin.shortUnreachable({ code: 'ECONNREFUSED' }), '连接被拒')
+  assert.equal(plugin.shortUnreachable({ code: 'ETIMEDOUT' }), '连接超时')
+  assert.equal(plugin.shortUnreachable({ code: 'EHOSTUNREACH' }), '主机 / 网络不可达')
+  assert.equal(plugin.shortUnreachable({ code: 'ENOTFOUND' }), '主机名解析不了')
+  assert.equal(plugin.shortUnreachable({ error: 'weird' }), '不通')
+  const rows = rowsOf(plugin.buildPanelView(panelRun(), panelCheck()), 'endpoints')
+  const row = rows.find((item) => item.key === '8000')
+  assert.match(row.title, /ECONNREFUSED：connect ECONNREFUSED 192\.168\.0\.119:8000/, '悬停里是完整原文')
+})
+
+await ta('端到端：POST /panel 回来的就是三块的视图（客户端照它渲染）', async () => {
+  const vllm = await vllmEngine()
+  const host = makeHost()
+  plugin.apply(host.ctx, { autoProbe: false, hosts: ['127.0.0.1'], ports: [vllm.port], includeConfigured: false })
+  const web = await serveRoutes(host.routes)
+  try {
+    const panel = await web.get(plugin.ROUTE_PANEL, { method: 'POST' })
+    assert.equal(panel.status, 200)
+    assert.deepEqual(panel.body.view.blocks.map((block) => block.title), ['接入检查', '模型列表', '自检'])
+    assert.equal(panel.body.view.verdict, 'ok')
+    const rows = panel.body.view.blocks.flatMap((block) => block.rows)
+    assert.ok(rows.some((row) => row.level === 'host' && row.text === '127.0.0.1'))
+    assert.ok(rows.some((row) => row.level === 'ok' && row.key === String(vllm.port)), '可达端口是绿点行')
+    assert.ok(rows.some((row) => row.key === 'qwen-local' && /已接入|已是最新/.test(row.text)))
+    assert.equal(host.mutations.length, 1, '面板那次确实跑了接入（新建了 provider）')
+
+    const notPost = await web.get(plugin.ROUTE_PANEL)
+    assert.equal(notPost.body.ok, false)
+    assert.match(notPost.body.error, /只接受 POST/)
+  } finally { await web.close(); await vllm.close() }
+})
+
+// ─────────────────────────────────────────────────────────────────────────
+// 5. 实机冒烟
+// ─────────────────────────────────────────────────────────────────────────
+
+section('5. 实机冒烟（192.168.0.119:8080）')
 
 await ta('真实端点：读出 model id 与 max_model_len', async () => {
   const result = await plugin.probeTarget(
