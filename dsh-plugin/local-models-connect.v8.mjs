@@ -90,7 +90,7 @@ export const name = 'local-models-connect'
 export const inject = ['webServer', 'settings']
 
 /** 版本号 —— 自检报告里回显，方便确认页面上跑的是哪一版。 */
-const VERSION = '1.6.0'
+const VERSION = '1.7.0'
 
 /** 写入的设置命名空间（`llm-pi-ai` 的注册者见 dsh-llm-pi-ai）。 */
 const NS = 'llm-pi-ai'
@@ -1321,12 +1321,15 @@ const PANEL_STYLE = `
 #lmc-tools .lmc-dot.ok { background: var(--dsw-alias-state-success-primary); }
 #lmc-tools .lmc-dot.warn { background: var(--dsw-alias-state-warn-primary); }
 #lmc-tools .lmc-dot.fail { background: var(--dsw-alias-state-error-primary); }
-/* 弹窗 = 外框（fixed，定宽）+ 右上角的叉 + 可滚动的正文。
+/* 弹窗 = 外框（fixed，定宽，**高度自适应**）+ 右上角的叉 + 正文。
+   高度不再钉 42vh：短报告就该是短的，别留一条空档还挂个滚动条（2026-09-25 用户要求
+   「不要滑动条，用自适应高度」）。放不下时的处置在 placeBox 里 —— 先往上挪，
+   真的比视口还高才退化成可滚动，那是唯一会出现滚动条的情况。
    不要把 overflow:auto 放在外框上：那样叉会跟着正文一起滚走。
    也不要给外框 cursor:pointer —— 它不是一个"点一下"的按钮（2026-09-24 用户的原话：
    「不想是可以点的按钮，换成叉叉在右上角」）。 */
 #lmc-box { position: fixed; z-index: 2147483000; display: none; text-align: left;
-  box-sizing: border-box; width: min(72vw, 560px); max-height: 42vh; overflow: hidden;
+  box-sizing: border-box; width: min(72vw, 560px); overflow: hidden;
   padding: 9px 11px; border-radius: 10px; border: .5px solid var(--dsw-alias-border-l4);
   background: var(--dsw-alias-bg-layer-3); color: var(--dsw-alias-label-primary);
   box-shadow: 0 8px 28px rgba(0, 0, 0, .3); }
@@ -1337,7 +1340,7 @@ const PANEL_STYLE = `
   color: var(--dsw-alias-label-secondary); font-size: 14px; line-height: 1; }
 #lmc-box .lmc-close:hover { background: var(--dsw-alias-interactive-bg-hover);
   color: var(--dsw-alias-label-primary); }
-#lmc-body { max-height: calc(42vh - 18px); overflow: auto; padding-right: 20px;
+#lmc-body { padding-right: 20px;
   font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 11px; line-height: 1.5;
   word-break: break-word; }
 /* 三个块（接入检查 / 模型列表 / 自检）：标题淡一档，块与块之间一条细线 + 间距。
@@ -1386,14 +1389,35 @@ function panelScript(autoHideMs) {
 
   function placeBox() {
     if (tools === null || box === null || !box.classList.contains('show')) return;
+    // 高度自适应：先清掉上一次可能留下的限高，量出**真实**高度。
+    body.style.maxHeight = '';
+    body.style.overflow = 'visible';
+
     // 宽度是 CSS 里写死的（width: min(72vw, 560px)），所以 offsetWidth 不受上一次 left 影响。
     // 这里刻意不用 max-width + shrink-to-fit：那样「可用宽度」会被上一次的 left 截断，
     // 量出来的是「剩下的空间」，每次重排都把弹窗又往左推一截（实测右边缘差 59px）。
     const width = box.offsetWidth;
     const rect = tools.getBoundingClientRect();
     const left = Math.max(8, Math.min(Math.round(rect.right - width), window.innerWidth - width - 8));
+
+    const margin = 8;
+    const room = window.innerHeight - margin;
+    let top = Math.round(rect.bottom + 8);
+    let height = box.offsetHeight;
+
+    // ① 默认就贴在工具条下面；② 放不下先往上挪（fixed 定位，挪它不影响页面布局）；
+    // ③ 挪了还放不下（内容比视口还高）→ 只有这时才退化成可滚动。
+    if (top + height > room) top = Math.max(margin, room - height);
+    if (top + height > room) {
+      const chrome = height - body.offsetHeight; // 外框自己的 padding + border
+      body.style.maxHeight = Math.max(80, room - top - chrome) + 'px';
+      body.style.overflow = 'auto';
+      height = box.offsetHeight;
+      top = Math.max(margin, Math.min(top, room - height));
+    }
+
     box.style.left = left + 'px';
-    box.style.top = Math.round(rect.bottom + 8) + 'px';
+    box.style.top = top + 'px';
   }
 
   /** 渲染视图 → 显示弹窗 → 重置自动收起计时。 */

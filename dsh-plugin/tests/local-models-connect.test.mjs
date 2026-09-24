@@ -6,13 +6,13 @@
  *   4. 实机冒烟：真打 192.168.0.119:8080（不在线只记 warn，不算失败）。
  *
  * 跑法：node dsh-plugin/tests/local-models-connect.test.mjs [插件路径]
- *       （不给路径就测同仓库的 ../local-models-connect.v7.mjs）
+ *       （不给路径就测同仓库的 ../local-models-connect.v8.mjs）
  */
 import assert from 'node:assert/strict'
 import http from 'node:http'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
-const MODULE_PATH = process.argv[2] ?? fileURLToPath(new URL('../local-models-connect.v7.mjs', import.meta.url))
+const MODULE_PATH = process.argv[2] ?? fileURLToPath(new URL('../local-models-connect.v8.mjs', import.meta.url))
 const plugin = await import(pathToFileURL(MODULE_PATH).href)
 
 let pass = 0
@@ -658,7 +658,14 @@ await ta('面板：单按钮挂到「在本地打开」左边且间距取容器 
   assert.match(script, /close\.textContent = '×'/)
   assert.match(script, /close\.setAttribute\('aria-label', '收起'\)/)
   assert.match(style, /#lmc-box \.lmc-close \{ position: absolute; top: 4px; right: 4px/, '叉固定在右上角')
-  assert.match(style, /#lmc-body \{[^}]*overflow: auto/, '正文自己滚，叉不跟着滚走')
+  assert.doesNotMatch(style, /#lmc-box \{[^}]*overflow: auto/, '外框不滚，否则叉会跟着正文滚走')
+  // 高度自适应：默认没有滚动条（用户 2026-09-25 要求）；只有「内容比视口还高」才在 JS 里临时开
+  assert.doesNotMatch(style, /max-height: 42vh/, '42vh 那个固定高度已去掉')
+  assert.doesNotMatch(style, /#lmc-body \{[^}]*max-height/, '正文不再钉死 max-height')
+  assert.doesNotMatch(style, /#lmc-body \{[^}]*overflow: auto/, '默认不滚')
+  assert.match(script, /body\.style\.maxHeight = '';/, '每次展示先清掉上次可能留下的限高')
+  assert.match(script, /if \(top \+ height > room\) top = Math\.max\(margin, room - height\);/, '放不下先往上挪')
+  assert.match(script, /body\.style\.overflow = 'auto';/, '挪了还放不下才退化成可滚动')
   assert.doesNotMatch(script, /box\.addEventListener\('click', hideBox\)/, '整块弹窗不再可点')
   assert.doesNotMatch(script, /点这里/, '那行「点这里…」提示已去掉')
   assert.doesNotMatch(style, /#lmc-box \{[^}]*cursor: pointer/, '外框不该长得像个按钮')

@@ -252,7 +252,7 @@ Never claim a fix without a measurement. Never report a benchmark from a cold st
 | `bench.sh` | full benchmark suite → `results/bench-<ts>.md` |
 | `scripts/modelctl` | lifecycle CLI (installed to `~/deploy-5060ti/modelctl`) |
 | `scripts/modelctl.next` + `scripts/profile_render.py` + `profiles/*.json` | profile-as-data runner (landed, **not** in systemd yet) — see [`docs/PROFILE-DATA.md`](docs/PROFILE-DATA.md) |
-| `dsh-plugin/local-models-connect.v7.mjs` + `dsh-plugin/tests/…` | DSH 宿主插件（2026-09-24 取代 `local-models-sync.v1`）：自动发现「哪个端口/什么模型/多少上下文」→ 自动接进模型列表 → 只读自检；GUI 会话头部「在本地打开」左侧的**一个**按钮（点一下 = 接入 + 自检，报告合一）；报告分三块（接入检查 / 模型列表 / 自检）、每行一根绿/黄/红状态点、主机只写一次 + 可自动收起 — see [`docs/DSH-MODEL-SYNC.md`](docs/DSH-MODEL-SYNC.md) |
+| `dsh-plugin/local-models-connect.v8.mjs` + `dsh-plugin/tests/…` | DSH 宿主插件（2026-09-24 取代 `local-models-sync.v1`）：自动发现「哪个端口/什么模型/多少上下文」→ 自动接进模型列表 → 只读自检；GUI 会话头部「在本地打开」左侧的**一个**按钮（点一下 = 接入 + 自检，报告合一）；报告分三块（接入检查 / 模型列表 / 自检）、每行一根绿/黄/红状态点、主机只写一次 + 可自动收起 — see [`docs/DSH-MODEL-SYNC.md`](docs/DSH-MODEL-SYNC.md) |
 | `dsh-plugin/local-models-sync.v1.mjs` | 上一代（只同步已手写的声明，不发现不新建）。已从 `~/.dsh/plugins` 卸载，源码留档 |
 | `scripts/vllm-merkyor-dflash-launch.sh` | production launch script; every knob is env-overridable |
 | `scripts/bench_gsq.py` | single-stream + needle recall |

@@ -39,11 +39,11 @@ models:
 
 ## 3. 新一代：`local-models-connect.v1`
 
-源码：[`../dsh-plugin/local-models-connect.v7.mjs`](../dsh-plugin/local-models-connect.v7.mjs)
+源码：[`../dsh-plugin/local-models-connect.v8.mjs`](../dsh-plugin/local-models-connect.v8.mjs)
 测试：[`../dsh-plugin/tests/local-models-connect.test.mjs`](../dsh-plugin/tests/local-models-connect.test.mjs)（81 条，`node dsh-plugin/tests/local-models-connect.test.mjs`）
 面板验证台：[`../dsh-plugin/tests/panel-harness.mjs`](../dsh-plugin/tests/panel-harness.mjs)（起一个仿真的会话头部 + 桩路由，供真浏览器驱动；真 GUI 要 token，而凭据不进 agent 命令）
 
-装到 `~/.dsh/plugins/local-models-connect.v7.mjs`，并在
+装到 `~/.dsh/plugins/local-models-connect.v8.mjs`，并在
 `~/.dsh/profiles/web/cordis.patch.yml` 里挂一条（见 §6）。**它取代了 `local-models-sync.v1`**。
 
 它做三件事：
@@ -148,8 +148,10 @@ curl -sS http://127.0.0.1:3080/local-models-connect/selfcheck | python3 -m json.
   按 Esc、滚页面、超时（`autoHideMs`，默认 12 秒）。
   **整块弹窗不可点**（`cursor` 是 `auto`，不是 `pointer`）—— 早先它自己就是关闭热区，
   于是报告末尾还得附一行「点这里…」的说明，看着像个大按钮（2026-09-24 用户要求换掉）。
-  叉是 22×22 的绝对定位按钮（`top/right: 4px`），挂在 `#lmc-box` 上；
-  可滚动的正文是**另一个元素** `#lmc-body`，否则叉会跟着正文一起滚走。
+  叉是 22×22 的绝对定位按钮（`top/right: 4px`），挂在 `#lmc-box` 上。
+  **高度自适应、默认没有滑动条**（用户 2026-09-25 的要求）：不再钉 `max-height: 42vh`，
+  短报告就是短的；`#lmc-body` 是**另一个元素**（这样叉不会跟着正文滚走），
+  只有「内容比视口还高」时才在 JS 里临时给它开 `overflow` —— 见 §4.2。
   旧版把报告留在文档流里，点一次就永久占一块地方 —— 也是 2026-09-24 点名要改的。
 
 ### 4.1 报告排版：三个块、一根状态点、主机只写一次
@@ -186,6 +188,33 @@ curl -sS http://127.0.0.1:3080/local-models-connect/selfcheck | python3 -m json.
   它和「dry-run 没写」是两回事，早先那句含糊话已经被问过一次。
 * 纯函数 ⇒ 可用普通单测钉住（`81 条` 里有 15 条专门测排版：主机只出现一次、点的颜色、
   解释只说一次、各 action 的文案、出错也成块）。
+
+### 4.2 高度自适应（不要滑动条）
+
+用户 2026-09-25 的要求。原来 `#lmc-box` 钉 `max-height: 42vh`、`#lmc-body` 钉
+`max-height: calc(42vh - 18px); overflow: auto` —— 报告一长就出滑动条，而且短报告也要
+先按 42vh 想一遍。现在 CSS 里**没有任何高度上限**，高度由内容决定；`#lmc-body` 默认不滚。
+
+放不下时按三步处置（都在 `placeBox()` 里，每次都先清掉上一次的限高再量真实高度）：
+
+| 情形 | 处置 | 会不会有滑动条 |
+|---|---|---|
+| 内容放得下工具条下方 | 直接贴在工具条下面 | 不会 |
+| 放不下、但比整个视口矮 | **往上挪**（`top = 视口底 − 高度`） | 不会 |
+| 比整个视口还高 | 夹到视口内（`top: 8`）+ 临时给正文开 `overflow: auto` | 会 —— 这是唯一一种 |
+
+弹窗是 `position: fixed`，所以往上挪不会推挤页面（也没有布局抖动）。
+
+真浏览器实测（视口 900px 高，工具条底 36px）：
+
+| 端口行数 | 盒子高度 | top | 默认位置(44) 是否上挪 | 滑动条 |
+|---|---|---|---|---|
+| 5（真机那种） | 387 | 44 | 否 | 无 |
+| 32 | 799 | 44 | 否 | 无 |
+| 37 | 882 | **10** | 是 | **无** |
+| 62 | 884（夹住） | 8 | 是 | 有（唯一一次） |
+
+`hasScrollbar` 是量 `body.scrollHeight > body.clientHeight` 得出的，不是看截图猜的。
 
 样式走独立的 `style` 注入行、脚本走 `script` 行（v1 把 CSS 塞在模板字符串里，改一个颜色
 都要数反斜杠）。页面加载时只读 `/state` 的缓存，不打网络。
@@ -248,7 +277,7 @@ v1 只强制引擎**广告出来的事实**（`contextWindow` / `maxTokens` 上�
 ```yaml
 - insert:
     - id: local-models-connect
-      name: "/home/lcy/.dsh/plugins/local-models-connect.v7.mjs"
+      name: "/home/lcy/.dsh/plugins/local-models-connect.v8.mjs"
       config:
         hosts: ['192.168.0.119']          # 种子主机：唯一的扫描范围，要加机器改这一行
         ports: [8080, 8000, 30000, 8081, 11434, 1234]
@@ -304,7 +333,7 @@ curl -sS http://127.0.0.1:3080/local-models-connect/state | python3 -m json.tool
 ```bash
 cp ~/.dsh/profiles/web/cordis.patch.yml.bak-before-local-models-connect-<ts> \
    ~/.dsh/profiles/web/cordis.patch.yml
-rm ~/.dsh/plugins/local-models-connect.v7.mjs
+rm ~/.dsh/plugins/local-models-connect.v8.mjs
 ```
 
 `settings.yaml` 的写入是幂等的（值没变就不写），回滚插件不会把设置改回去。

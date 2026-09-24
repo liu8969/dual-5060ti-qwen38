@@ -13,16 +13,21 @@
  *     少了这层包裹就验不出「插在 `_split` 前面会拿不到容器的 gap」这个 bug。
  *
  * 用法：
- *   node dsh-plugin/tests/panel-harness.mjs [插件路径] [autoHideMs] [端口]
+ *   node dsh-plugin/tests/panel-harness.mjs [插件路径] [autoHideMs] [端口] [long]
+ * 第 5 个参数 = 端口行数（`long` = 60）。用来验高度自适应那两条退路：
+ * 30 行左右「放不下但比视口矮」（应当往上挪、没有滑动条），60 行「比视口还高」（唯一会有滑动条的情况）。
  * 然后把打印出的 URL 交给浏览器工具。
  */
 import http from 'node:http'
 import { writeFileSync } from 'node:fs'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
-const MODULE = process.argv[2] ?? fileURLToPath(new URL('../local-models-connect.v7.mjs', import.meta.url))
+const MODULE = process.argv[2] ?? fileURLToPath(new URL('../local-models-connect.v8.mjs', import.meta.url))
 const AUTO_HIDE_MS = Number(process.argv[3] ?? 9000)
 const PORT = Number(process.argv[4] ?? 18181)
+// 第 5 个参数：端口行数（'long' = 60）。用来验「内容高于视口下方空间」与「比整个视口还高」两条退路。
+const ROWS_ARG = process.argv[5] ?? ''
+const ROWS = ROWS_ARG === 'long' ? 60 : (Number(ROWS_ARG) > 0 ? Number(ROWS_ARG) : 0)
 const plugin = await import(pathToFileURL(MODULE).href)
 
 // ── 取真插件导出的注入行 ──
@@ -111,7 +116,7 @@ const RUN = {
   ok: true, at: '2026-09-24T18:19:31.615Z', dryRun: false, wrote: false,
   candidates: ['192.168.0.119:8080'], targets: [
     { baseURL: 'http://192.168.0.119:8080/v1', origin: 'http://192.168.0.119:8080', host: '192.168.0.119', port: 8080, reachable: true, status: 200, latencyMs: 9, engine: 'vllm', models: [{ id: 'Qwen3.8-27B-Q6-dual-5060ti', name: 'x', contextWindow: 150000 }] },
-    ...[8000, 30000, 8081, 11434, 1234].map((port) => ({
+    ...(ROWS > 0 ? Array.from({ length: ROWS }, (_, i) => 9000 + i) : [8000, 30000, 8081, 11434, 1234]).map((port) => ({
       baseURL: `http://192.168.0.119:${port}/v1`, origin: `http://192.168.0.119:${port}`, host: '192.168.0.119', port,
       reachable: false, code: 'ECONNREFUSED', error: `ECONNREFUSED：connect ECONNREFUSED 192.168.0.119:${port}`
     }))
