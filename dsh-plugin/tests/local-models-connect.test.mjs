@@ -1,0 +1,893 @@
+/**
+ * local-models-connect 的测试。分四层：
+ *   1. 纯逻辑（不碰网络）：配置解析、列表解析、上下文字段优先级、合并、diff、压缩余量。
+ *   2. 探测层：用本地起的三台假引擎（vLLM / llama.cpp / Ollama）+ 一个关掉的端口。
+ *   3. 端到端：apply() 注册的路由挂到真 http 服务器上，走一遍 state/run/selfcheck/旧别名。
+ *   4. 实机冒烟：真打 192.168.0.119:8080（不在线只记 warn，不算失败）。
+ *
+ * 跑法：node dsh-plugin/tests/local-models-connect.test.mjs [插件路径]
+ *       （不给路径就测同仓库的 ../local-models-connect.v1.mjs）
+ */
+import assert from 'node:assert/strict'
+import http from 'node:http'
+import { fileURLToPath, pathToFileURL } from 'node:url'
+
+const MODULE_PATH = process.argv[2] ?? fileURLToPath(new URL('../local-models-connect.v1.mjs', import.meta.url))
+const plugin = await import(pathToFileURL(MODULE_PATH).href)
+
+let pass = 0
+let fail = 0
+const failures = []
+
+function ok(name) { pass++; console.log(`  \u001b[32m✓\u001b[0m ${name}`) }
+function bad(name, detail) { fail++; failures.push(`${name} — ${detail}`); console.log(`  \u001b[31m✗\u001b[0m ${name}\n      ${detail}`) }
+function t(name, fn) {
+  try { fn(); ok(name) } catch (error) { bad(name, error.message) }
+}
+async function ta(name, fn) {
+  try { await fn(); ok(name) } catch (error) { bad(name, error.message) }
+}
+const section = (title) => console.log(`\n\u001b[1m${title}\u001b[0m`)
+
+// ─────────────────────────────────────────────────────────────────────────
+// 假引擎
+// ─────────────────────────────────────────────────────────────────────────
+
+function json(res, status, body) {
+  const text = JSON.stringify(body)
+  res.writeHead(status, { 'content-type': 'application/json' })
+  res.end(text)
+}
+
+/** 起一台假引擎；返回 { origin, port, close, hits }。 */
+async function fakeEngine(handler) {
+  const hits = []
+  const server = http.createServer((req, res) => {
+    let body = ''
+    req.on('data', (chunk) => { body += chunk })
+    req.on('end', () => {
+      hits.push(`${req.method} ${req.url}`)
+      handler(req, res, body)
+    })
+  })
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const port = server.address().port
+  return {
+    origin: `http://127.0.0.1:${port}`,
+    port,
+    hits,
+    close: () => new Promise((resolve) => server.close(resolve))
+  }
+}
+
+const vllmEngine = () => fakeEngine((req, res) => {
+  if (req.url === '/v1/models') {
+    return json(res, 200, {
+      object: 'list',
+      data: [{
+        id: 'Qwen3.8-27B-Q6-dual-5060ti', object: 'model', owned_by: 'vllm',
+        root: '/home/lcy/Models/Merkyor-W4A4/NVFP4/W4A4', max_model_len: 150000
+      }]
+    })
+  }
+  if (req.url === '/health') return json(res, 200, { status: 'ok' })
+  json(res, 404, {})
+})
+
+/** llama.cpp：/v1/models 只给训练长度，服务端实参只在 /props 里。 */
+const llamaEngine = (serverCtx = 262144, trainCtx = 32768) => fakeEngine((req, res) => {
+  if (req.url === '/v1/models') {
+    return json(res, 200, {
+      object: 'list',
+      data: [{ id: 'qwen3-27b-gguf', object: 'model', meta: { n_ctx_train: trainCtx } }]
+    })
+  }
+  if (req.url === '/props') {
+    return json(res, 200, { default_generation_settings: { n_ctx: serverCtx }, n_ctx: serverCtx, total_slots: 1 })
+  }
+  if (req.url === '/health') return json(res, 200, { status: 'ok' })
+  json(res, 404, {})
+})
+
+/** Ollama：/v1/models 什么上下文都不给，只有 /api/show 说得出。 */
+const ollamaEngine = () => fakeEngine((req, res, body) => {
+  if (req.url === '/v1/models') {
+    return json(res, 200, { object: 'list', data: [{ id: 'qwen3:8b', object: 'model', owned_by: 'ollama' }] })
+  }
+  if (req.url === '/api/show') {
+    assert.ok(body.includes('qwen3:8b'), 'ollama show 应该带上模型名')
+    return json(res, 200, { model_info: { 'qwen3.context_length': 40960 } })
+  }
+  json(res, 404, {})
+})
+
+/** 一个确定没人听的端口。 */
+async function deadPort() {
+  const server = http.createServer(() => {})
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const port = server.address().port
+  await new Promise((resolve) => server.close(resolve))
+  return port
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// 假宿主（Cordis ctx）
+// ─────────────────────────────────────────────────────────────────────────
+
+function applyOps(section, ops) {
+  for (const op of ops) {
+    let cursor = section
+    for (const key of op.path.slice(0, -1)) {
+      if (cursor[key] === undefined || typeof cursor[key] !== 'object') cursor[key] = {}
+      cursor = cursor[key]
+    }
+    const last = op.path.at(-1)
+    if (op.op === 'set') cursor[last] = op.value
+    else delete cursor[last]
+  }
+}
+
+function makeHost(initialSection = {}, options = {}) {
+  const state = { section: structuredClone(initialSection) }
+  const routes = new Map()
+  const injects = []
+  const effects = []
+  const mutations = []
+  const logs = []
+  const ctx = {
+    logger: { info: (...a) => logs.push(['info', a]), warn: (...a) => logs.push(['warn', a]), debug: () => {} },
+    effect: (fn, label) => { effects.push({ label, dispose: fn() }) },
+    on: (event, fn) => { injects.push({ event, fn }) },
+    get: (name) => (name === 'credentials' ? options.credentials : undefined),
+    webServer: { register: (route) => { routes.set(route.path, route); return () => routes.delete(route.path) } },
+    settings: {
+      section: (ns) => state.section[ns],
+      mutate: async (ns, ops) => {
+        mutations.push({ ns, ops })
+        if (state.section[ns] === undefined || state.section[ns] === null) state.section[ns] = {}
+        applyOps(state.section[ns], ops)
+      }
+    }
+  }
+  return { ctx, routes, injects, effects, mutations, logs, state }
+}
+
+/** 把注册的路由挂到真 http 服务器上，走一遍网络路径。 */
+async function serveRoutes(routes) {
+  const server = http.createServer((req, res) => {
+    const path = new URL(req.url, 'http://localhost').pathname
+    const route = routes.get(path)
+    if (route === undefined) { res.writeHead(404); res.end('no route'); return }
+    Promise.resolve(route.handler(req, res)).catch((error) => { res.writeHead(500); res.end(String(error)) })
+  })
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const base = `http://127.0.0.1:${server.address().port}`
+  return {
+    base,
+    get: async (path, init) => {
+      const response = await fetch(base + path, init)
+      return { status: response.status, body: await response.json() }
+    },
+    close: () => new Promise((resolve) => server.close(resolve))
+  }
+}
+
+const baseConfig = (overrides = {}) => plugin.resolveConfig({ probeTimeoutMs: 800, concurrency: 4, autoProbe: false, ...overrides })
+
+// ─────────────────────────────────────────────────────────────────────────
+// 1. 纯逻辑
+// ─────────────────────────────────────────────────────────────────────────
+
+section('1. 纯逻辑')
+
+t('配置：不写 config 也能工作（默认 119 + 端口表）', () => {
+  const config = plugin.resolveConfig(undefined)
+  assert.deepEqual(config.hosts, ['192.168.0.119'])
+  assert.equal(config.ports[0], 8080)
+  assert.equal(config.providerId, 'qwen-local')
+  assert.equal(config.autoProbe, true)
+  assert.equal(config.autoApply, true)
+  assert.equal(config.prune, false)
+  assert.equal(config.adoptUnknownContext, false)
+})
+
+t('配置：字符串形式的 hosts/ports 也收（方便在 yml 里一行写完）', () => {
+  const config = plugin.resolveConfig({ hosts: '192.168.0.119, 10.0.0.5', ports: '8080 8000' })
+  assert.deepEqual(config.hosts, ['192.168.0.119', '10.0.0.5'])
+  assert.deepEqual(config.ports, [8080, 8000])
+})
+
+t('配置：坏值回落到默认，不抛', () => {
+  const config = plugin.resolveConfig({ ports: 'abc', hosts: '', probeTimeoutMs: -5, concurrency: 0 })
+  assert.deepEqual(config.ports, plugin.resolveConfig(undefined).ports)
+  assert.deepEqual(config.hosts, ['192.168.0.119'])
+  assert.equal(config.probeTimeoutMs, 1500)
+  assert.equal(config.concurrency, 6)
+})
+
+t('配置：默认不挂凭据名（新环境没有那份凭据时不会 MISSING_CREDENTIAL）', () => {
+  assert.equal(plugin.resolveConfig(undefined).apiKeyEnv, '')
+})
+
+t('配置：显式写空 = 关掉，不回落默认（providerId / displayName / apiKeyEnv）', () => {
+  const config = plugin.resolveConfig({ providerId: '', displayName: '', apiKeyEnv: '' })
+  assert.equal(config.providerId, '')
+  assert.equal(config.displayName, '')
+  assert.equal(config.apiKeyEnv, '')
+  // 而「没写这个键」仍然走默认
+  assert.equal(plugin.resolveConfig({}).providerId, 'qwen-local')
+})
+
+t('配置：apiKeyEnv 也接受 false 表示关掉', () => {
+  assert.equal(plugin.resolveConfig({ apiKeyEnv: false }).apiKeyEnv, '')
+})
+
+t('parseListing：vLLM 的 data 数组读到 id 与 max_model_len', () => {
+  const entries = plugin.parseListing({
+    object: 'list',
+    data: [{ id: 'Qwen3.8-27B-Q6-dual-5060ti', owned_by: 'vllm', max_model_len: 150000 }]
+  })
+  assert.equal(entries.length, 1)
+  assert.equal(entries[0].id, 'Qwen3.8-27B-Q6-dual-5060ti')
+  assert.equal(entries[0].contextWindow, 150000)
+  assert.equal(plugin.detectEngine(entries), 'vllm')
+})
+
+t('parseListing：models 映射用键当 id（键优先于嵌套 id）', () => {
+  const entries = plugin.parseListing({ models: { 'alias-a': { id: 'canonical', context_length: 8192 } } })
+  assert.equal(entries[0].id, 'alias-a')
+  assert.equal(entries[0].contextWindow, 8192)
+})
+
+t('parseListing：缺 id 的行跳过而不是整份失败', () => {
+  const entries = plugin.parseListing({ data: [{ max_model_len: 100 }, { id: 'good' }] })
+  assert.deepEqual(entries.map((e) => e.id), ['good'])
+})
+
+t('parseListing：既没有 data 也没有 models → 抛（调用方转成一条 error）', () => {
+  assert.throws(() => plugin.parseListing({ object: 'list' }), /既没有 data/)
+})
+
+t('上下文：n_ctx_train 只进 trainContext，绝不进 contextWindow（llama.cpp 档）', () => {
+  const entries = plugin.parseListing({ data: [{ id: 'gguf', meta: { n_ctx_train: 32768 } }] })
+  assert.equal(entries[0].contextWindow, undefined, '训练长度不能当声明值')
+  assert.equal(entries[0].trainContext, 32768)
+})
+
+t('上下文：强字段优先于训练长度', () => {
+  const entries = plugin.parseListing({ data: [{ id: 'x', max_model_len: 150000, meta: { n_ctx_train: 32768 } }] })
+  assert.equal(entries[0].contextWindow, 150000)
+})
+
+t('上下文：limit.context / max_input_tokens 也认', () => {
+  assert.equal(plugin.readContext({ limit: { context: 4096 } }), 4096)
+  assert.equal(plugin.readContext({ max_input_tokens: '200000' }), 200000)
+})
+
+t('readMaxTokens：max_output_tokens / limit.output 都认', () => {
+  assert.equal(plugin.readMaxTokens({ max_output_tokens: 8192 }), 8192)
+  assert.equal(plugin.readMaxTokens({ limit: { output: 2048 } }), 2048)
+  assert.equal(plugin.readMaxTokens({}), undefined)
+})
+
+t('contextFromShow：Ollama 的 model_info.<family>.context_length', () => {
+  assert.equal(plugin.contextFromShow({ model_info: { 'qwen3.context_length': 40960, 'x.block_count': 64 } }), 40960)
+})
+
+t('contextFromShow：退化到 parameters 里的 num_ctx', () => {
+  assert.equal(plugin.contextFromShow({ parameters: 'stop "<|im_end|>"\nnum_ctx 32768\n' }), 32768)
+})
+
+t('compactionHeadroom：150000 / 16384 的余量算得对', () => {
+  const head = plugin.compactionHeadroom(150000, 16384)
+  assert.equal(head.threshold, 120000)
+  assert.equal(head.headroom, 13616)
+})
+
+t('compactionHeadroom：声明的 maxTokens 过大时余量为负（会判 fail）', () => {
+  assert.ok(plugin.compactionHeadroom(150000, 60000).headroom < 0)
+})
+
+t('isPrivate：内网与回环为真，公网为假', () => {
+  assert.equal(plugin.isPrivate('http://192.168.0.119:8080/v1'), true)
+  assert.equal(plugin.isPrivate('http://127.0.0.1:8080/v1'), true)
+  assert.equal(plugin.isPrivate('http://10.1.2.3/v1'), true)
+  assert.equal(plugin.isPrivate('https://api.openai.com/v1'), false)
+})
+
+t('mergeProfile：新建 provider 写全必需字段，且不给无鉴权端点挂凭据名', () => {
+  const discovered = {
+    baseURL: 'http://127.0.0.1:9999/v1', origin: 'http://127.0.0.1:9999', host: '127.0.0.1', port: 9999,
+    engine: 'vllm', models: [{ id: 'm1', name: 'm1', contextWindow: 150000 }]
+  }
+  const { profile, skipped } = plugin.mergeProfile(discovered, undefined, { providerId: 'p', displayName: '本地', apiKeyEnv: '' }, baseConfig())
+  assert.equal(profile.api, 'openai-completions')
+  assert.equal(profile.baseURL, 'http://127.0.0.1:9999/v1')
+  assert.deepEqual(profile.compat, { maxTokensField: 'max_tokens' })
+  assert.equal(profile.streamIdleTimeoutMs, 600000)
+  assert.equal(profile.defaultContextWindow, 150000, '兜底值取该端点已知上下文的最小值')
+  assert.equal('apiKeyEnv' in profile, false)
+  assert.deepEqual(skipped, [])
+  assert.equal(profile.models[0].maxTokens, 16384)
+})
+
+t('mergeProfile：maxTokens 被夹在 contextWindow 之内', () => {
+  const discovered = {
+    baseURL: 'http://127.0.0.1:9999/v1', origin: 'http://127.0.0.1:9999', host: '127.0.0.1', port: 9999,
+    engine: 'unknown', models: [{ id: 'tiny', name: 'tiny', contextWindow: 4096 }]
+  }
+  const { profile } = plugin.mergeProfile(discovered, undefined, { providerId: 'p', displayName: '', apiKeyEnv: '' }, baseConfig())
+  assert.equal(profile.models[0].maxTokens, 4096)
+})
+
+t('mergeProfile：上下文未知时默认不建条目（从源头挡住 262144 回落）', () => {
+  const discovered = {
+    baseURL: 'http://127.0.0.1:9999/v1', origin: 'http://127.0.0.1:9999', host: '127.0.0.1', port: 9999,
+    engine: 'unknown', models: [{ id: 'mystery', name: 'mystery', trainContext: 32768 }]
+  }
+  const { profile, skipped } = plugin.mergeProfile(discovered, undefined, { providerId: 'p', displayName: '', apiKeyEnv: '' }, baseConfig())
+  assert.deepEqual(profile.models, [])
+  assert.equal(skipped.length, 1)
+  assert.match(skipped[0].reason, /训练长度/)
+})
+
+t('mergeProfile：adoptUnknownContext=true 时才用兜底值建条目', () => {
+  const discovered = {
+    baseURL: 'http://127.0.0.1:9999/v1', origin: 'http://127.0.0.1:9999', host: '127.0.0.1', port: 9999,
+    engine: 'unknown',
+    models: [{ id: 'known', name: 'known', contextWindow: 32000 }, { id: 'mystery', name: 'mystery' }]
+  }
+  const { profile, skipped } = plugin.mergeProfile(discovered, undefined, { providerId: 'p', displayName: '', apiKeyEnv: '' }, baseConfig({ adoptUnknownContext: true }))
+  assert.deepEqual(skipped, [])
+  assert.equal(profile.models.find((m) => m.id === 'mystery').contextWindow, 32000)
+})
+
+t('mergeProfile：已有条目的 contextWindow 取引擎值、name 保留人工写的', () => {
+  const existing = {
+    displayName: '我起的名', baseURL: 'http://127.0.0.1:9999/v1',
+    models: [{ id: 'm1', name: '人工名', contextWindow: 999999, maxTokens: 16384 }]
+  }
+  const discovered = {
+    baseURL: 'http://127.0.0.1:9999/v1', origin: 'http://127.0.0.1:9999', host: '127.0.0.1', port: 9999,
+    engine: 'vllm', models: [{ id: 'm1', name: 'engine-name', contextWindow: 150000 }]
+  }
+  const { profile } = plugin.mergeProfile(discovered, existing, { providerId: 'p', displayName: '不该覆盖', apiKeyEnv: 'KEY' }, baseConfig())
+  assert.equal(profile.displayName, '我起的名')
+  assert.equal(profile.models[0].name, '人工名')
+  assert.equal(profile.models[0].contextWindow, 150000)
+  assert.equal(profile.baseURL, 'http://127.0.0.1:9999/v1')
+})
+
+t('mergeProfile：prune=false 保留引擎不再广告的旧条目', () => {
+  const existing = { models: [{ id: 'old', name: 'old', contextWindow: 8192, maxTokens: 1024 }] }
+  const discovered = {
+    baseURL: 'http://127.0.0.1:9999/v1', origin: 'http://127.0.0.1:9999', host: '127.0.0.1', port: 9999,
+    engine: 'vllm', models: [{ id: 'new', name: 'new', contextWindow: 150000 }]
+  }
+  const kept = plugin.mergeProfile(discovered, existing, { providerId: 'p', displayName: '', apiKeyEnv: '' }, baseConfig())
+  assert.deepEqual(kept.profile.models.map((m) => m.id).sort(), ['new', 'old'])
+  const pruned = plugin.mergeProfile(discovered, existing, { providerId: 'p', displayName: '', apiKeyEnv: '' }, baseConfig({ prune: true }))
+  assert.deepEqual(pruned.profile.models.map((m) => m.id), ['new'])
+})
+
+t('mergeProfile：已有条目但引擎没报上下文 → 保留声明值，不跳过', () => {
+  const existing = { models: [{ id: 'm1', name: 'm1', contextWindow: 150000, maxTokens: 16384 }] }
+  const discovered = {
+    baseURL: 'http://127.0.0.1:9999/v1', origin: 'http://127.0.0.1:9999', host: '127.0.0.1', port: 9999,
+    engine: 'unknown', models: [{ id: 'm1', name: 'm1', trainContext: 32768 }]
+  }
+  const { profile, skipped } = plugin.mergeProfile(discovered, existing, { providerId: 'p', displayName: '', apiKeyEnv: '' }, baseConfig())
+  assert.deepEqual(skipped, [])
+  assert.equal(profile.models[0].contextWindow, 150000)
+})
+
+t('diffProfile：新增模型 / 改上下文 / 移除模型都出得来', () => {
+  const before = { models: [{ id: 'a', contextWindow: 100, maxTokens: 10 }, { id: 'gone', contextWindow: 5 }] }
+  const after = { models: [{ id: 'a', contextWindow: 200, maxTokens: 10 }, { id: 'b', contextWindow: 300 }] }
+  const fields = plugin.diffProfile(before, after).map((c) => `${c.id ?? ''}:${c.field}`)
+  assert.ok(fields.includes('a:contextWindow'))
+  assert.ok(fields.includes('b:(新增模型)'))
+  assert.ok(fields.includes('gone:(移除模型)'))
+})
+
+t('pickProviderId：baseURL 已存在 → 复用，不新建', () => {
+  const existing = new Map([['http://192.168.0.119:8080', 'qwen-local']])
+  const id = plugin.pickProviderId({ origin: 'http://192.168.0.119:8080', host: '192.168.0.119', port: 8080 },
+    existing, { providerId: 'qwen-local' }, baseConfig(), new Set(['qwen-local']))
+  assert.equal(id, 'qwen-local')
+})
+
+t('pickProviderId：固定名只给第一个命中者，第二个走自动名', () => {
+  const naming = { providerId: 'qwen-local' }
+  const first = plugin.pickProviderId({ origin: 'http://192.168.0.119:8080', host: '192.168.0.119', port: 8080 },
+    new Map(), naming, baseConfig(), new Set())
+  assert.equal(first, 'qwen-local')
+  const second = plugin.pickProviderId({ origin: 'http://127.0.0.1:1234', host: '127.0.0.1', port: 1234 },
+    new Map(), naming, baseConfig(), new Set(['qwen-local']))
+  assert.equal(second, 'local-127-0-0-1-1234')
+})
+
+t('autoProviderId：点分/冒号都收敛成合法路由名', () => {
+  assert.equal(plugin.autoProviderId('192.168.0.119', 8080), 'local-192-168-0-119-8080')
+  assert.equal(plugin.autoProviderId('::1', 8000), 'local-1-8000')
+})
+
+t('candidateTargets：顺序 = hosts × ports，且去重', () => {
+  const targets = plugin.candidateTargets(baseConfig({ hosts: ['192.168.0.119', '127.0.0.1'], ports: [8080, 8000], includeConfigured: false }), {})
+  assert.deepEqual(targets.map((t) => `${t.host}:${t.port}`),
+    ['192.168.0.119:8080', '192.168.0.119:8000', '127.0.0.1:8080', '127.0.0.1:8000'])
+})
+
+t('candidateTargets：includeConfigured 收编已配内网 provider，公网端点不纳', () => {
+  const targets = plugin.candidateTargets(
+    baseConfig({ hosts: ['192.168.0.119'], ports: [8080], includeConfigured: true }),
+    { providers: { 'qwen-local': { baseURL: 'http://192.168.0.119:8080/v1' }, remote: { baseURL: 'https://api.example.com/v1' }, other: { baseURL: 'http://10.9.9.9:9000/v1' } } }
+  )
+  const keys = targets.map((t) => `${t.host}:${t.port}`)
+  assert.deepEqual(keys, ['192.168.0.119:8080', '10.9.9.9:9000'])
+})
+
+t('indexProvidersByOrigin：按 origin 建索引', () => {
+  const map = plugin.indexProvidersByOrigin({ providers: { a: { baseURL: 'http://192.168.0.119:8080/v1' }, b: { baseURL: 'nonsense' } } })
+  assert.equal(map.get('http://192.168.0.119:8080'), 'a')
+  assert.equal(map.size, 1)
+})
+
+await ta('credentialStatus：空名 = none（不挂凭据，不需要解析）', async () => {
+  const status = await plugin.credentialStatus({ get: () => undefined }, '')
+  assert.equal(status.state, 'none')
+})
+
+await ta('credentialStatus：凭据服务里有 → ok', async () => {
+  const ctx = { get: (name) => (name === 'credentials' ? { resolve: async (ref) => (ref === 'HAVE' ? { value: 'secret' } : undefined) } : undefined) }
+  const status = await plugin.credentialStatus(ctx, 'HAVE')
+  assert.equal(status.state, 'ok')
+  assert.equal(status.from, '凭据服务')
+})
+
+await ta('credentialStatus：凭据服务与环境变量都没有 → missing（用时会抛 MISSING_CREDENTIAL）', async () => {
+  const ctx = { get: (name) => (name === 'credentials' ? { resolve: async () => undefined } : undefined) }
+  const status = await plugin.credentialStatus(ctx, 'LMC_DEFINITELY_NOT_SET')
+  assert.equal(status.state, 'missing')
+})
+
+await ta('credentialStatus：环境变量里有 → ok', async () => {
+  process.env.LMC_TEST_CRED = 'from-env'
+  try {
+    const ctx = { get: (name) => (name === 'credentials' ? { resolve: async () => undefined } : undefined) }
+    const status = await plugin.credentialStatus(ctx, 'LMC_TEST_CRED')
+    assert.equal(status.state, 'ok')
+    assert.equal(status.from, '环境变量')
+  } finally { delete process.env.LMC_TEST_CRED }
+})
+
+await ta('credentialStatus：名字不合法 → missing 且说明原因', async () => {
+  const status = await plugin.credentialStatus({ get: () => undefined }, 'not a valid name!')
+  assert.equal(status.state, 'missing')
+  assert.match(status.note, /不是合法的凭据名/)
+})
+
+await ta('credentialStatus：没有凭据服务、环境变量也没有 → unknown 而不是 missing（不许误判）', async () => {
+  const status = await plugin.credentialStatus({ get: () => undefined }, 'LMC_DEFINITELY_NOT_SET')
+  assert.equal(status.state, 'unknown')
+})
+
+// ─────────────────────────────────────────────────────────────────────────
+// 2. 探测层（假引擎）
+// ─────────────────────────────────────────────────────────────────────────
+
+section('2. 探测层')
+
+await ta('probeTarget：vLLM 形状 → id + 上下文 + engine', async () => {
+  const engine = await vllmEngine()
+  try {
+    const result = await plugin.probeTarget(
+      { baseURL: `${engine.origin}/v1`, origin: engine.origin, host: '127.0.0.1', port: engine.port }, baseConfig())
+    assert.equal(result.reachable, true)
+    assert.equal(result.engine, 'vllm')
+    assert.equal(result.models[0].id, 'Qwen3.8-27B-Q6-dual-5060ti')
+    assert.equal(result.models[0].contextWindow, 150000)
+    assert.ok(result.latencyMs >= 0)
+  } finally { await engine.close() }
+})
+
+await ta('probeTarget：llama.cpp 用 /props 的 n_ctx，而不是 /v1/models 的 n_ctx_train', async () => {
+  const engine = await llamaEngine(262144, 32768)
+  try {
+    const result = await plugin.probeTarget(
+      { baseURL: `${engine.origin}/v1`, origin: engine.origin, host: '127.0.0.1', port: engine.port }, baseConfig())
+    assert.equal(result.engine, 'llama.cpp')
+    assert.equal(result.models[0].contextWindow, 262144, '必须取服务端 -c 实参')
+    assert.equal(result.models[0].trainContext, 32768)
+    assert.ok(engine.hits.includes('GET /props'))
+  } finally { await engine.close() }
+})
+
+await ta('probeTarget：Ollama 走 /api/show 拿 model_info.context_length', async () => {
+  const engine = await ollamaEngine()
+  try {
+    const result = await plugin.probeTarget(
+      { baseURL: `${engine.origin}/v1`, origin: engine.origin, host: '127.0.0.1', port: engine.port }, baseConfig())
+    assert.equal(result.engine, 'ollama')
+    assert.equal(result.models[0].contextWindow, 40960)
+    assert.ok(engine.hits.some((h) => h.startsWith('POST /api/show')))
+  } finally { await engine.close() }
+})
+
+await ta('probeTarget：端口不通 → reachable:false 且带 error，不抛', async () => {
+  const port = await deadPort()
+  const result = await plugin.probeTarget(
+    { baseURL: `http://127.0.0.1:${port}/v1`, origin: `http://127.0.0.1:${port}`, host: '127.0.0.1', port }, baseConfig())
+  assert.equal(result.reachable, false)
+  assert.ok(typeof result.error === 'string' && result.error.length > 0)
+})
+
+await ta('probeTarget：列表结构不对 → reachable 但带读不动的 error', async () => {
+  const engine = await fakeEngine((req, res) => {
+    if (req.url === '/v1/models') return json(res, 200, { object: 'list' })
+    json(res, 404, {})
+  })
+  try {
+    const result = await plugin.probeTarget(
+      { baseURL: `${engine.origin}/v1`, origin: engine.origin, host: '127.0.0.1', port: engine.port }, baseConfig())
+    assert.equal(result.reachable, true)
+    assert.match(result.error, /列表读不动/)
+  } finally { await engine.close() }
+})
+
+// ─────────────────────────────────────────────────────────────────────────
+// 3. 端到端（apply + 真 http）
+// ─────────────────────────────────────────────────────────────────────────
+
+section('3. 端到端')
+
+await ta('apply：注册 4 条路由，注入 style + script 两行，且启动日志有版本号', async () => {
+  const host = makeHost()
+  plugin.apply(host.ctx, { autoProbe: false })
+  assert.deepEqual([...host.routes.keys()].sort(),
+    [plugin.ROUTE_RUN, plugin.ROUTE_SELFCHECK, plugin.ROUTE_STATE, plugin.LEGACY_ROUTE_RUN].sort())
+  const table = []
+  for (const inject of host.injects) if (inject.event === 'webserver/index-inject') inject.fn(table)
+  assert.equal(table.length, 2)
+  assert.equal(table[0].kind, 'style')
+  assert.equal(table[1].kind, 'script')
+  assert.ok(!table[1].text.includes('</script'), '注入脚本里不能出现 </script')
+  assert.ok(host.logs.some(([, args]) => args.map(String).join(' ').includes(plugin.VERSION)))
+})
+
+await ta('端到端：新环境（没有任何 provider）→ run 建出 provider 并写进设置', async () => {
+  const vllm = await vllmEngine()
+  const host = makeHost()
+  plugin.apply(host.ctx, {
+    autoProbe: false, hosts: ['127.0.0.1'], ports: [vllm.port], includeConfigured: false
+  })
+  const web = await serveRoutes(host.routes)
+  try {
+    const state = await web.get(plugin.ROUTE_STATE)
+    assert.equal(state.body.version, plugin.VERSION)
+    assert.equal(state.body.lastRun, null)
+
+    const run = await web.get(plugin.ROUTE_RUN, { method: 'POST' })
+    assert.equal(run.body.wrote, true)
+    assert.equal(run.body.providers[0].provider, 'qwen-local')
+    assert.equal(run.body.providers[0].action, 'created')
+
+    // 写进去的东西必须能被下一次读出来（假宿主模拟了 set 语义）
+    const written = host.state.section['llm-pi-ai'].providers['qwen-local']
+    assert.equal(written.baseURL, `${vllm.origin}/v1`)
+    assert.equal(written.api, 'openai-completions')
+    assert.equal(written.defaultContextWindow, 150000)
+    assert.equal(written.models[0].contextWindow, 150000)
+    assert.equal(written.models[0].maxTokens, 16384)
+    assert.equal(written.models[0].name, 'Qwen3.8-27B-Q6-dual-5060ti')
+    assert.equal(host.mutations.length, 1)
+
+    // 幂等：再跑一次不该再写
+    const again = await web.get(plugin.ROUTE_RUN, { method: 'POST' })
+    assert.equal(again.body.wrote, false)
+    assert.equal(again.body.providers[0].action, 'unchanged')
+    assert.equal(host.mutations.length, 1)
+  } finally { await web.close(); await vllm.close() }
+})
+
+await ta('端到端：dry=1 只看不写', async () => {
+  const vllm = await vllmEngine()
+  const host = makeHost()
+  plugin.apply(host.ctx, { autoProbe: false, hosts: ['127.0.0.1'], ports: [vllm.port], includeConfigured: false })
+  const web = await serveRoutes(host.routes)
+  try {
+    const run = await web.get(`${plugin.ROUTE_RUN}?dry=1`, { method: 'POST' })
+    assert.equal(run.body.dryRun, true)
+    assert.equal(run.body.wrote, false)
+    assert.equal(run.body.providers[0].action, 'would-change')
+    assert.equal(host.mutations.length, 0, 'dry-run 一个字节都不能写')
+    assert.equal(host.state.section['llm-pi-ai'], undefined)
+  } finally { await web.close(); await vllm.close() }
+})
+
+await ta('端到端：GET 打 run → 明确报错（写操作只收 POST）', async () => {
+  const host = makeHost()
+  plugin.apply(host.ctx, { autoProbe: false, hosts: ['127.0.0.1'], ports: [], includeConfigured: false })
+  const web = await serveRoutes(host.routes)
+  try {
+    const run = await web.get(plugin.ROUTE_RUN)
+    assert.equal(run.body.ok, false)
+    assert.match(run.body.error, /只接受 POST/)
+  } finally { await web.close() }
+})
+
+await ta('端到端：旧路径 /local-models-sync/run 仍然可用（v1 兼容）', async () => {
+  const vllm = await vllmEngine()
+  const host = makeHost()
+  plugin.apply(host.ctx, { autoProbe: false, hosts: ['127.0.0.1'], ports: [vllm.port], includeConfigured: false })
+  const web = await serveRoutes(host.routes)
+  try {
+    const run = await web.get(plugin.LEGACY_ROUTE_RUN, { method: 'POST' })
+    assert.equal(run.body.providers[0].provider, 'qwen-local')
+  } finally { await web.close(); await vllm.close() }
+})
+
+await ta('端到端：自检 verdict=warn（端点活着、声明还没接上）', async () => {
+  const vllm = await vllmEngine()
+  const host = makeHost()
+  plugin.apply(host.ctx, { autoProbe: false, hosts: ['127.0.0.1'], ports: [vllm.port], includeConfigured: false })
+  const web = await serveRoutes(host.routes)
+  try {
+    const check = await web.get(plugin.ROUTE_SELFCHECK)
+    assert.equal(check.body.verdict, 'warn')
+    assert.equal(check.body.summary.reachable, 1)
+    assert.equal(check.body.summary.models, 1)
+    assert.equal(check.body.summary.pendingEndpoints, 1)
+    assert.ok(check.body.checks.some((c) => c.id === 'link:http://127.0.0.1:' + vllm.port))
+    assert.equal(check.body.targets[0].health.ok, true)
+    assert.equal(host.mutations.length, 0, '自检只读')
+  } finally { await web.close(); await vllm.close() }
+})
+
+await ta('端到端：接上之后自检 verdict=ok，且余量算得出来', async () => {
+  const vllm = await vllmEngine()
+  const host = makeHost()
+  plugin.apply(host.ctx, { autoProbe: false, hosts: ['127.0.0.1'], ports: [vllm.port], includeConfigured: false })
+  const web = await serveRoutes(host.routes)
+  try {
+    await web.get(plugin.ROUTE_RUN, { method: 'POST' })
+    const check = await web.get(plugin.ROUTE_SELFCHECK)
+    assert.equal(check.body.verdict, 'ok', JSON.stringify(check.body.checks.filter((c) => c.level !== 'ok')))
+    assert.equal(check.body.summary.linkedProviders, 1)
+    assert.equal(check.body.summary.pendingEndpoints, 0)
+    assert.ok(check.body.checks.some((c) => c.id === 'ok:qwen-local/Qwen3.8-27B-Q6-dual-5060ti'))
+  } finally { await web.close(); await vllm.close() }
+})
+
+await ta('端到端：声明被改坏（999999）→ 自检报 warn 且 run 修回来', async () => {
+  const vllm = await vllmEngine()
+  const host = makeHost({
+    'llm-pi-ai': {
+      providers: {
+        'qwen-local': {
+          displayName: '人工写的名字', api: 'openai-completions', baseURL: `${vllm.origin}/v1`,
+          models: [{ id: 'Qwen3.8-27B-Q6-dual-5060ti', name: '人工模型名', contextWindow: 999999, maxTokens: 16384 }]
+        }
+      }
+    }
+  })
+  plugin.apply(host.ctx, { autoProbe: false, hosts: ['127.0.0.1'], ports: [vllm.port], includeConfigured: false })
+  const web = await serveRoutes(host.routes)
+  try {
+    const before = await web.get(plugin.ROUTE_SELFCHECK)
+    assert.equal(before.body.verdict, 'warn')
+    assert.ok(before.body.checks.some((c) => c.id.startsWith('context:qwen-local/')))
+
+    const run = await web.get(plugin.ROUTE_RUN, { method: 'POST' })
+    assert.equal(run.body.providers[0].action, 'updated')
+    const fixed = host.state.section['llm-pi-ai'].providers['qwen-local']
+    assert.equal(fixed.models[0].contextWindow, 150000)
+    assert.equal(fixed.displayName, '人工写的名字', '人工字段不被覆盖')
+    assert.equal(fixed.models[0].name, '人工模型名', '人工模型名不被覆盖')
+
+    const after = await web.get(plugin.ROUTE_SELFCHECK)
+    assert.equal(after.body.verdict, 'ok')
+  } finally { await web.close(); await vllm.close() }
+})
+
+await ta('端到端：手写的 maxTokens 大过压缩余量 → 自检 fail 并给出建议值', async () => {
+  const vllm = await vllmEngine()
+  const host = makeHost({
+    'llm-pi-ai': {
+      providers: {
+        'qwen-local': {
+          api: 'openai-completions', baseURL: `${vllm.origin}/v1`,
+          models: [{ id: 'Qwen3.8-27B-Q6-dual-5060ti', contextWindow: 150000, maxTokens: 60000 }]
+        }
+      }
+    }
+  })
+  plugin.apply(host.ctx, { autoProbe: false, hosts: ['127.0.0.1'], ports: [vllm.port], includeConfigured: false })
+  const web = await serveRoutes(host.routes)
+  try {
+    // maxTokens 是使用偏好、不是引擎事实，run 不会替你改（只夹到 contextWindow 之内）——
+    // 这种「声明能过 schema、但压缩阈值塞不下」的坑才是自检存在的意义。
+    await web.get(plugin.ROUTE_RUN, { method: 'POST' })
+    assert.equal(host.state.section['llm-pi-ai'].providers['qwen-local'].models[0].maxTokens, 60000)
+    const check = await web.get(plugin.ROUTE_SELFCHECK)
+    assert.equal(check.body.verdict, 'fail')
+    const headroom = check.body.checks.find((c) => c.id.startsWith('headroom:qwen-local/'))
+    assert.ok(headroom, '必须报出 headroom 这一条')
+    assert.match(headroom.detail, /把 maxTokens 降到 30000/)
+  } finally { await web.close(); await vllm.close() }
+})
+
+await ta('端到端：全部端口不通 → 自检 fail 且指明「一个都没通」', async () => {
+  const port = await deadPort()
+  const host = makeHost()
+  plugin.apply(host.ctx, { autoProbe: false, hosts: ['127.0.0.1'], ports: [port], includeConfigured: false, probeTimeoutMs: 500 })
+  const web = await serveRoutes(host.routes)
+  try {
+    const check = await web.get(plugin.ROUTE_SELFCHECK)
+    assert.equal(check.body.verdict, 'fail')
+    assert.ok(check.body.checks.some((c) => c.id === 'reachability'))
+    assert.equal(check.body.summary.reachable, 0)
+  } finally { await web.close() }
+})
+
+await ta('端到端：上下文读不到 → 不建 provider，报告里明说', async () => {
+  const engine = await fakeEngine((req, res) => {
+    if (req.url === '/v1/models') return json(res, 200, { data: [{ id: 'mystery', object: 'model' }] })
+    json(res, 404, {})
+  })
+  const host = makeHost()
+  plugin.apply(host.ctx, { autoProbe: false, hosts: ['127.0.0.1'], ports: [engine.port], includeConfigured: false, probeTimeoutMs: 500 })
+  const web = await serveRoutes(host.routes)
+  try {
+    const run = await web.get(plugin.ROUTE_RUN, { method: 'POST' })
+    assert.equal(run.body.providers[0].action, 'skipped')
+    assert.match(run.body.providers[0].error, /上下文都读不到/)
+    assert.equal(host.mutations.length, 0)
+  } finally { await web.close(); await engine.close() }
+})
+
+await ta('端到端：开机自动接入（autoProbe=true）确实自己跑了一遍', async () => {
+  const vllm = await vllmEngine()
+  const host = makeHost()
+  plugin.apply(host.ctx, {
+    autoProbe: true, autoApply: true, autoProbeDelayMs: 10,
+    hosts: ['127.0.0.1'], ports: [vllm.port], includeConfigured: false
+  })
+  try {
+    const deadline = Date.now() + 4000
+    while (host.mutations.length === 0 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 25))
+    }
+    assert.equal(host.mutations.length, 1)
+    assert.equal(host.state.section['llm-pi-ai'].providers['qwen-local'].models[0].contextWindow, 150000)
+    const logged = host.logs.map(([, args]) => String(args[0])).join('\n')
+    assert.match(logged, /自动接入/)
+  } finally {
+    for (const effect of host.effects) if (typeof effect.dispose === 'function') effect.dispose()
+    await vllm.close()
+  }
+})
+
+await ta('端到端：autoApply=false 时自动探测只报告不写', async () => {
+  const vllm = await vllmEngine()
+  const host = makeHost()
+  plugin.apply(host.ctx, {
+    autoProbe: true, autoApply: false, autoProbeDelayMs: 10,
+    hosts: ['127.0.0.1'], ports: [vllm.port], includeConfigured: false
+  })
+  try {
+    const deadline = Date.now() + 4000
+    while (host.state.section['llm-pi-ai'] === undefined && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 25))
+    }
+    await new Promise((resolve) => setTimeout(resolve, 150))
+    assert.equal(host.mutations.length, 0)
+    assert.equal(host.state.section['llm-pi-ai'], undefined)
+  } finally {
+    for (const effect of host.effects) if (typeof effect.dispose === 'function') effect.dispose()
+    await vllm.close()
+  }
+})
+
+await ta('端到端：一台 llama.cpp 一台 vLLM 同时在线 → 两条 provider，固定名给第一个', async () => {
+  const vllm = await vllmEngine()
+  const llama = await llamaEngine(131072, 32768)
+  const host = makeHost()
+  plugin.apply(host.ctx, {
+    autoProbe: false, hosts: ['127.0.0.1'], ports: [vllm.port, llama.port], includeConfigured: false
+  })
+  const web = await serveRoutes(host.routes)
+  try {
+    const run = await web.get(plugin.ROUTE_RUN, { method: 'POST' })
+    const ids = run.body.providers.map((p) => p.provider).sort()
+    assert.deepEqual(ids, ['local-127-0-0-1-' + llama.port, 'qwen-local'].sort())
+    const providers = host.state.section['llm-pi-ai'].providers
+    assert.equal(providers['qwen-local'].models[0].contextWindow, 150000)
+    assert.equal(providers['local-127-0-0-1-' + llama.port].models[0].contextWindow, 131072)
+    assert.equal(providers['local-127-0-0-1-' + llama.port].compat.maxTokensField, 'max_tokens')
+  } finally { await web.close(); await vllm.close(); await llama.close() }
+})
+
+await ta('端到端：provider 声明了取不到的凭据 → 自检 fail 并指名 MISSING_CREDENTIAL', async () => {
+  const vllm = await vllmEngine()
+  const host = makeHost({
+    'llm-pi-ai': {
+      providers: {
+        'qwen-local': {
+          api: 'openai-completions', baseURL: `${vllm.origin}/v1`, apiKeyEnv: 'LMC_DEFINITELY_NOT_SET',
+          models: [{ id: 'Qwen3.8-27B-Q6-dual-5060ti', contextWindow: 150000, maxTokens: 16384 }]
+        }
+      }
+    }
+  }, { credentials: { resolve: async () => undefined } })
+  plugin.apply(host.ctx, { autoProbe: false, hosts: ['127.0.0.1'], ports: [vllm.port], includeConfigured: false })
+  const web = await serveRoutes(host.routes)
+  try {
+    const check = await web.get(plugin.ROUTE_SELFCHECK)
+    assert.equal(check.body.verdict, 'fail')
+    const item = check.body.checks.find((c) => c.id === 'credential:qwen-local')
+    assert.ok(item, '必须报出 credential:qwen-local')
+    assert.match(item.detail, /MISSING_CREDENTIAL/)
+  } finally { await web.close(); await vllm.close() }
+})
+
+await ta('端到端：凭据能取到时自检回到 ok', async () => {
+  const vllm = await vllmEngine()
+  const host = makeHost({
+    'llm-pi-ai': {
+      providers: {
+        'qwen-local': {
+          api: 'openai-completions', baseURL: `${vllm.origin}/v1`, apiKeyEnv: 'LMC_PRESENT',
+          models: [{ id: 'Qwen3.8-27B-Q6-dual-5060ti', contextWindow: 150000, maxTokens: 16384 }]
+        }
+      }
+    }
+  }, { credentials: { resolve: async (ref) => (ref === 'LMC_PRESENT' ? { value: 'x' } : undefined) } })
+  plugin.apply(host.ctx, { autoProbe: false, hosts: ['127.0.0.1'], ports: [vllm.port], includeConfigured: false })
+  const web = await serveRoutes(host.routes)
+  try {
+    const check = await web.get(plugin.ROUTE_SELFCHECK)
+    assert.equal(check.body.verdict, 'ok', JSON.stringify(check.body.checks.filter((c) => c.level !== 'ok')))
+    assert.ok(check.body.checks.some((c) => c.id === 'credentials'))
+  } finally { await web.close(); await vllm.close() }
+})
+
+await ta('端到端：全新环境建出的 provider 不挂任何凭据名', async () => {
+  const vllm = await vllmEngine()
+  const host = makeHost()
+  plugin.apply(host.ctx, { autoProbe: false, hosts: ['127.0.0.1'], ports: [vllm.port], includeConfigured: false })
+  const web = await serveRoutes(host.routes)
+  try {
+    await web.get(plugin.ROUTE_RUN, { method: 'POST' })
+    const provider = host.state.section['llm-pi-ai'].providers['qwen-local']
+    assert.equal('apiKeyEnv' in provider, false, '新环境不该挂本地机器才有的凭据名')
+  } finally { await web.close(); await vllm.close() }
+})
+
+// ─────────────────────────────────────────────────────────────────────────
+// 4. 实机冒烟
+// ─────────────────────────────────────────────────────────────────────────
+
+section('4. 实机冒烟（192.168.0.119:8080）')
+
+await ta('真实端点：读出 model id 与 max_model_len', async () => {
+  const result = await plugin.probeTarget(
+    { baseURL: 'http://192.168.0.119:8080/v1', origin: 'http://192.168.0.119:8080', host: '192.168.0.119', port: 8080 },
+    baseConfig({ probeTimeoutMs: 4000 }))
+  if (!result.reachable) {
+    console.log(`  \u001b[33m·\u001b[0m 实机不在线，跳过（${result.error}）`)
+    return
+  }
+  assert.equal(result.engine, 'vllm')
+  assert.equal(result.models[0].id, 'Qwen3.8-27B-Q6-dual-5060ti')
+  assert.equal(result.models[0].contextWindow, 150000)
+})
+
+// ─────────────────────────────────────────────────────────────────────────
+
+console.log(`\n\u001b[1m${pass} 通过，${fail} 失败\u001b[0m`)
+if (fail > 0) {
+  console.log('\n失败明细：')
+  for (const line of failures) console.log('  · ' + line)
+  process.exitCode = 1
+}

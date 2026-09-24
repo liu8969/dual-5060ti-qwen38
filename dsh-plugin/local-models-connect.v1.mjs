@@ -1,0 +1,1324 @@
+/**
+ * local-models-connect —— 「接入本地大模型」：自动发现端口 / 模型名 / 上下文，自动接入，自带自检。
+ *
+ * ## 它和上一代（local-models-sync.v1）差在哪
+ *
+ * v1 只做一件事：把**已经手写在 `llm-pi-ai` 里**的本地 provider，按引擎自报的
+ * `max_model_len` 修正 `contextWindow`。它不发现、不新建 —— 新机器上没有任何 provider
+ * 时，它一个端点都不会去看，点了按钮只会回「没有可同步的 provider」。
+ *
+ * 这一代把口径从「同步已有声明」改成「**接入本地大模型**」：
+ *
+ *   1. **发现**：对配置里的种子主机 × 候选端口逐个探 `{origin}/v1/models`，
+ *      读出「哪个端口、以什么 model name、有多少上下文」；
+ *   2. **接入**：没有对应 provider 就**整条建出来**（baseURL / api / models / compat），
+ *      已经有就只更新引擎说了算的字段 —— 所以新环境装上插件即可用，不必先手写声明；
+ *   3. **自检**：一条只读通道，把「端点通不通 / 认出什么模型 / 声明和引擎对不对得上 /
+ *      自动压缩阈值安不安全」逐条判出 ok·warn·fail，并在页面上常驻显示。
+ *
+ * ## 为什么上下文一定要从引擎自报值来（这是整个插件的承重点）
+ *
+ * `contextWindow` 决定 `dsh-compaction-basic` 的自动压缩阈值（0.8 × contextWindow）。
+ * 声明大于引擎实际 = 压缩不来 = 会话长到中间某段被 vLLM 直接拒掉。DSH 自带的
+ * 「获取可用模型」救不了这件事，三条都是源码级的（见 `docs/DSH-MODEL-SYNC.md`）：
+ * `readListing` 只认 `context_window` / `context_length`（vLLM 给的是 `max_model_len`）；
+ * `adoptPicked` 对已存在的 id 不替换；缺 `contextWindow` 会回落到 262144。
+ *
+ * 各引擎自报字段并不统一，本插件按可信度分两档收集（见 `readContext` / `readTrainContext`）：
+ *
+ *   **可用作声明**（服务端真实上限）
+ *     · vLLM / SGLang  `/v1/models` → `max_model_len`
+ *     · OpenAI 兼容网关 `/v1/models` → `context_length` / `context_window`
+ *     · llama.cpp      `/props`     → `default_generation_settings.n_ctx`（`-c` 的实参）
+ *     · Ollama         `/api/show`  → `model_info.*.context_length`
+ *
+ *   **只作证据、绝不写进声明**
+ *     · llama.cpp `/v1/models` → `meta.n_ctx_train`（**训练**长度）
+ *
+ * 最后一档是本插件最容易写错的地方，所以单独拉出来：llama256 档服务端 `-c 262144`，
+ * 而同一份权重 `n_ctx_train` 可能只有 32768 —— 取哪个都能过，取错方向一个让压缩过早
+ * （长任务被无谓截断），另一个就是 v1 文档里那个「声明 196608 / 实际 150000」的事故。
+ * 因此 `n_ctx_train` 只出现在自检报告的说明里，**永不参与合并**；上下文拿不到时宁可
+ * 不建条目（见下）。
+ *
+ * ## 「拿不到上下文」怎么办：宁可少一条，不给错值
+ *
+ * 缺 `contextWindow` 的模型条目会让 pi-ai 回落到 `defaultContextWindow = 262144` ——
+ * 这正是 v1 文档里最糟的那一档。所以自动新建时：
+ *   · 新 provider 会带上 `defaultContextWindow` = 该端点**已知上下文的最小值**（兜底不再是 262144）；
+ *   · 单个模型上下文未知且无安全兜底 → **不建这一条**，在报告里明说（要强行建就设
+ *     `adoptUnknownContext: true`）。少一条能选是响的、可逆的；错一个值是哑的、会在
+ *     150K 处炸会话。
+ *
+ * ## 为什么还是宿主插件（而不是客户端插件 / 一个外部脚本）
+ *
+ * 与 v1 同因，一字未改：客户端模块包元数据按名字缓存且永不过期，新增客户端包**必须重启
+ * `dsh web`**，而那个进程正是宿主本体；宿主插件挂在 `cordis.patch.yml` 上，Cordis HMR
+ * 重放配置树 → 保存即生效。而 `settings.mutate` 本来就是宿主侧服务，直接调 = 官方 schema
+ * 校验 + 原子写 + 热重载，既不用拼客户端 RPC，也不涉及浏览器跨域。
+ *
+ * ## 写设置的边界（「自动」不等于「乱写」）
+ *
+ *   · 只碰命中 `PRIVATE_HOST` 的端点（内网 / 回环），远端 API 一律不探；
+ *   · **只增不删**：`prune` 默认关，引擎不再广告的旧模型条目原样保留（可能是你手写的）；
+ *   · 人工写的字段优先：`name` / `displayName` / `apiKeyEnv` / `compat` / `headers` 等
+ *     已有值一律不被覆盖，只补引擎能证明的 `contextWindow` / `maxTokens`；
+ *   · 已有 provider 按 **baseURL 精确匹配**复用，绝不改名、绝不新建重复路由；
+ *   · 新建时才写 `apiKeyEnv`，且**只写配置里显式给的那个** —— `dsh-llm-pi-ai` 的
+ *     `resolveApiKey` 在 apiKeyEnv 存在但凭据缺失时直接抛 `MISSING_CREDENTIAL`，
+ *     给一个无鉴权的本地端点挂上凭据名，会把能用的端点变成用不了的；
+ *   · 任一步失败只回报，不写文件；写失败也不回滚已验证的其它 provider。
+ *
+ * ## 迭代提示
+ *
+ * Cordis 只在 `name`（= 文件路径）变化时才重新 `import` 模块（ESM 有模块缓存），
+ * 所以改内容要装成新文件名（v2、v3…）并改 `cordis.patch.yml` 里那一行；
+ * 只重存同一个文件不会重新加载。
+ */
+
+export const name = 'local-models-connect'
+export const inject = ['webServer', 'settings']
+
+/** 版本号 —— 自检报告里回显，方便确认页面上跑的是哪一版。 */
+const VERSION = '1.0.0'
+
+/** 写入的设置命名空间（`llm-pi-ai` 的注册者见 dsh-llm-pi-ai）。 */
+const NS = 'llm-pi-ai'
+
+/** 三条路由：状态、接入、自检；外加 v1 的旧路径做兼容别名。 */
+const ROUTE_STATE = '/local-models-connect/state'
+const ROUTE_RUN = '/local-models-connect/run'
+const ROUTE_SELFCHECK = '/local-models-connect/selfcheck'
+const LEGACY_ROUTE_RUN = '/local-models-sync/run'
+
+/** 只碰内网 / 回环端点，避免拿没配 key 的远端 API 去试。 */
+const PRIVATE_HOST = /^(localhost|127\.|\[?::1\]?|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/i
+
+/** 可作为声明的上下文长度字段，按可信度从高到低。 */
+const CONTEXT_PATHS = [
+  ['max_model_len'],                        // vLLM / SGLang
+  ['context_length'],                       // OpenAI 兼容通用；Ollama model_info
+  ['context_window'],
+  ['max_context_length'],
+  ['n_ctx'],
+  ['default_generation_settings', 'n_ctx'], // llama.cpp 服务端 `-c` 实参
+  ['max_input_tokens'],
+  ['limit', 'context']
+]
+/** **只作证据**的训练长度：出现在报告里，永不参与合并。理由见文件头。 */
+const TRAIN_CONTEXT_PATHS = [['meta', 'n_ctx_train'], ['n_ctx_train']]
+/** 单次最大输出 token 的候选字段。 */
+const MAXTOKENS_PATHS = [
+  ['max_output_tokens'],
+  ['max_completion_tokens'],
+  ['max_tokens'],
+  ['limit', 'output'],
+  ['top_provider', 'max_completion_tokens']
+]
+
+/**
+ * 默认配置。`cordis.patch.yml` 里那个 `config:` 块按字段覆盖这里。
+ * 全部字段都有默认值 —— 一行 `config` 都不写也能工作（这是「新环境装上就能用」的前提）。
+ */
+const DEFAULT_CONFIG = {
+  /** 种子主机：只扫这里列出的主机（要改就改这一行，默认 119）。 */
+  hosts: ['192.168.0.119'],
+  /** 每个主机上依次试的端口。 */
+  ports: [8080, 8000, 30000, 8081, 11434, 1234],
+  /** 除种子主机外，是否也顺带刷新「已配 provider 里的内网端点」（只读它们已有的 baseURL）。 */
+  includeConfigured: true,
+  /**
+   * 第一个命中的端点用这个 provider 路由名（留空则按 `local-<ip>-<port>` 自动命名）。
+   * 默认指向 qwen-local：这个路由名在文档、脚本、铁律 11 里到处被引用。
+   */
+  providerId: 'qwen-local',
+  /** 新建 provider 时的显示名（留空则用 `<路由名>（本地）`）。 */
+  displayName: 'Qwen3.8-27B 本地',
+  /**
+   * 新建 provider 时挂的凭据名。**默认空 = 不挂**。
+   *
+   * 这是「新环境装上就能用」的关键一条：`dsh-llm-pi-ai` 的 `resolveApiKey` 在
+   * `apiKeyEnv` 存在、而凭据服务与环境变量里都没有该值时**直接抛 MISSING_CREDENTIAL**
+   * —— 一个无鉴权的本地端点被挂上 `QWEN_LOCAL_API_KEY`，在配了那份凭据的机器上能用、
+   * 换台机器就整个模型不可用。已存在的 provider 不会被改（见 mergeProfile），所以
+   * 本机那份手写的 qwen-local 照旧。
+   */
+  apiKeyEnv: '',
+  /** 插件加载后是否自动跑一次「发现 + 接入」（这是「新环境装上就能识别」的那一步）。 */
+  autoProbe: true,
+  /** 自动跑时是否真的写设置。设 false = 只发现、只报告，等价于一次开机自检。 */
+  autoApply: true,
+  /** 引擎不再广告的旧模型条目是否删掉。默认 false（只增不删）。 */
+  prune: false,
+  /** 上下文未知的模型是否照建（用兜底值）。默认 false —— 从源头挡住 262144 那类错值。 */
+  adoptUnknownContext: false,
+  /** 单个探测请求的超时。 */
+  probeTimeoutMs: 1500,
+  /** 并发探测数（种子端点少，6 足够且不打扰网络）。 */
+  concurrency: 6,
+  /** 本地模型冷启动慢，流空闲超时给宽一点（沿用 qwen-local 的 600000）。 */
+  streamIdleTimeoutMs: 600000,
+  /** 引擎没说最大输出时，新模型条目用的 maxTokens。 */
+  defaultMaxTokens: 16384,
+  /** 是否允许探测公网端点。默认 false（本插件的用途就是内网本地模型）。 */
+  allowPublic: false,
+  /** 自动探测的延迟，让 dsh web 先把页面服务起来。 */
+  autoProbeDelayMs: 4000
+}
+
+const msg = (error) => (error && error.message) || String(error)
+
+// ─────────────────────────────────────────────────────────────────────────
+// 配置解析（手写校验：宿主插件的第二参数是 patch yml 里的裸对象，没有 schema 兜底）
+// ─────────────────────────────────────────────────────────────────────────
+
+const asArray = (value, fallback) => {
+  if (Array.isArray(value)) return value
+  if (typeof value === 'string' && value.trim() !== '') {
+    return value.split(/[,\s]+/).map((s) => s.trim()).filter(Boolean)
+  }
+  return fallback
+}
+
+const asString = (value, fallback = '') =>
+  (typeof value === 'string' && value.trim() !== '' ? value.trim() : fallback)
+
+/**
+ * 「没写」与「显式写空」是两件事：
+ *   · 键不存在 → 用默认值；
+ *   · 写成 `''` / `false` / `null` → **就是空**（providerId 空 = 自动命名，apiKeyEnv 空 = 不挂凭据）。
+ * 否则「留空以关闭」这个最自然的写法会静默回落到默认值 —— 冒烟测试里就是这么被抓到的。
+ */
+const asOptionalString = (source, key, fallback) => {
+  const value = source[key]
+  if (value === false || value === null) return ''
+  if (typeof value === 'string') return value.trim()
+  return fallback
+}
+
+const asPositiveInt = (value, fallback) => {
+  const n = Number(value)
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback
+}
+
+const asBool = (value, fallback) => (typeof value === 'boolean' ? value : fallback)
+
+/** 把 patch yml 的 config 收成一份带默认值、字段类型可靠的配置。 */
+export function resolveConfig(raw) {
+  const source = raw && typeof raw === 'object' ? raw : {}
+  const ports = asArray(source.ports, DEFAULT_CONFIG.ports)
+    .map((p) => Number(p))
+    .filter((p) => Number.isInteger(p) && p > 0 && p < 65536)
+  const hosts = asArray(source.hosts, DEFAULT_CONFIG.hosts)
+    .map((h) => String(h).trim())
+    .filter(Boolean)
+  return {
+    hosts: hosts.length > 0 ? hosts : [...DEFAULT_CONFIG.hosts],
+    ports: ports.length > 0 ? ports : [...DEFAULT_CONFIG.ports],
+    includeConfigured: asBool(source.includeConfigured, DEFAULT_CONFIG.includeConfigured),
+    providerId: asOptionalString(source, 'providerId', DEFAULT_CONFIG.providerId),
+    displayName: asOptionalString(source, 'displayName', DEFAULT_CONFIG.displayName),
+    apiKeyEnv: asOptionalString(source, 'apiKeyEnv', DEFAULT_CONFIG.apiKeyEnv),
+    autoProbe: asBool(source.autoProbe, DEFAULT_CONFIG.autoProbe),
+    autoApply: asBool(source.autoApply, DEFAULT_CONFIG.autoApply),
+    prune: asBool(source.prune, DEFAULT_CONFIG.prune),
+    adoptUnknownContext: asBool(source.adoptUnknownContext, DEFAULT_CONFIG.adoptUnknownContext),
+    probeTimeoutMs: asPositiveInt(source.probeTimeoutMs, DEFAULT_CONFIG.probeTimeoutMs),
+    concurrency: asPositiveInt(source.concurrency, DEFAULT_CONFIG.concurrency),
+    streamIdleTimeoutMs: asPositiveInt(source.streamIdleTimeoutMs, DEFAULT_CONFIG.streamIdleTimeoutMs),
+    defaultMaxTokens: asPositiveInt(source.defaultMaxTokens, DEFAULT_CONFIG.defaultMaxTokens),
+    allowPublic: asBool(source.allowPublic, DEFAULT_CONFIG.allowPublic),
+    autoProbeDelayMs: asPositiveInt(source.autoProbeDelayMs, DEFAULT_CONFIG.autoProbeDelayMs)
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// 纯逻辑：URL / 字段读取 / 列表解析 / 合并 / diff  —— 不依赖 Cordis，可直接单测
+// ─────────────────────────────────────────────────────────────────────────
+
+/** 从 baseURL 剥出 `http://host:port`，非法则 null。 */
+export function originOf(baseURL) {
+  try {
+    const url = new URL(baseURL)
+    return `${url.protocol}//${url.host}`
+  } catch {
+    return null
+  }
+}
+
+/** `/v1` 归一：配置里写不写 `/v1` 都能用。 */
+export function normalizeBaseURL(baseURL, origin) {
+  const raw = asString(baseURL)
+  const base = raw !== '' ? raw : `${origin}/v1`
+  return base.replace(/\/+$/, '')
+}
+
+export function isPrivate(baseURL) {
+  const origin = originOf(baseURL)
+  if (origin === null) return false
+  try {
+    return PRIVATE_HOST.test(new URL(origin).host)
+  } catch {
+    return false
+  }
+}
+
+/** 按候选路径逐个取值，返回第一个正整数。 */
+function readNumber(source, paths) {
+  for (const path of paths) {
+    let cursor = source
+    for (const key of path) {
+      if (cursor === null || typeof cursor !== 'object') { cursor = undefined; break }
+      cursor = cursor[key]
+    }
+    const n = typeof cursor === 'string' ? Number(cursor) : cursor
+    if (typeof n === 'number' && Number.isFinite(n) && n > 0) return Math.floor(n)
+  }
+  return undefined
+}
+
+/** 引擎自报的、**可写进声明**的上下文长度。 */
+export function readContext(raw) {
+  return readNumber(raw, CONTEXT_PATHS)
+}
+
+/** 模型的训练长度 —— 只作证据，永不参与合并（见文件头）。 */
+export function readTrainContext(raw) {
+  return readNumber(raw, TRAIN_CONTEXT_PATHS)
+}
+
+/** 引擎自报的最大输出 token。 */
+export function readMaxTokens(raw) {
+  return readNumber(raw, MAXTOKENS_PATHS)
+}
+
+/**
+ * 认引擎。只看**证据**，不猜：
+ *   · `owned_by` 自报；· 出现 `max_model_len` = vLLM 家族；· `/props` 通 = llama.cpp。
+ */
+export function detectEngine(entries) {
+  const owned = new Set(entries.map((e) => String(e.ownedBy ?? '').toLowerCase()).filter(Boolean))
+  if (owned.has('vllm')) return 'vllm'
+  if (owned.has('sglang')) return 'sglang'
+  if (entries.some((e) => e.sawMaxModelLen)) return 'vllm'
+  if (entries.some((e) => e.sawProps)) return 'llama.cpp'
+  return 'unknown'
+}
+
+/**
+ * 读一份模型列表响应。`data` 数组优先，其次 `models` 映射（键即端点认的 id）——
+ * 与 `dsh-llm-pi-ai` 的 `readListing` 同口径，免得同一份响应两边读出不同结果。
+ * @returns 归一后的条目数组；结构完全不是列表时抛错（由调用方转成一条 error）。
+ */
+export function parseListing(body) {
+  const listing = body
+  let listed
+  const data = listing?.data
+  if (Array.isArray(data)) {
+    listed = data.map((raw) => ({ raw }))
+  } else {
+    const models = listing?.models
+    if (models === null || typeof models !== 'object' || Array.isArray(models)) {
+      throw new Error('返回里既没有 data 数组也没有 models 映射')
+    }
+    listed = Object.entries(models)
+      .filter(([, raw]) => raw !== null && typeof raw === 'object' && !Array.isArray(raw))
+      .map(([key, raw]) => ({ key, raw }))
+  }
+
+  const entries = []
+  for (const { key, raw } of listed) {
+    const entry = raw ?? {}
+    const id = asString(
+      typeof key === 'string' && key !== '' ? key : entry.id ?? entry.model ?? entry.name
+    )
+    if (id === '') continue // 一条坏行不该毁掉整个端点
+    entries.push({
+      id,
+      name: asString(entry.name ?? entry.display_name ?? entry.displayName, id),
+      contextWindow: readContext(entry),
+      trainContext: readTrainContext(entry),
+      maxTokens: readMaxTokens(entry),
+      ownedBy: asString(entry.owned_by ?? entry.ownedBy),
+      // 证据位：这两条参与 detectEngine，不进最终声明。
+      sawMaxModelLen: readNumber(entry, [['max_model_len']]) !== undefined,
+      sawProps: false
+    })
+  }
+  return entries
+}
+
+/**
+ * Ollama 的 `/api/show`：`model_info` 里 `<family>.context_length` 是主来源，
+ * `parameters` 里的 `num_ctx`（Modelfile 里设的）次之。
+ */
+export function contextFromShow(show) {
+  const direct = readContext(show)
+  if (direct !== undefined) return direct
+  const info = show?.model_info
+  if (info !== null && typeof info === 'object' && !Array.isArray(info)) {
+    let best
+    for (const [key, value] of Object.entries(info)) {
+      if (!/\.context_length$/i.test(key)) continue
+      const n = Number(value)
+      if (Number.isFinite(n) && n > 0) best = best === undefined ? Math.floor(n) : Math.max(best, Math.floor(n))
+    }
+    if (best !== undefined) return best
+  }
+  const parameters = show?.parameters
+  if (typeof parameters === 'string') {
+    const hit = /(?:^|\n)\s*num_ctx\s+(\d+)/.exec(parameters)
+    if (hit !== null) {
+      const n = Number(hit[1])
+      if (Number.isFinite(n) && n > 0) return Math.floor(n)
+    }
+  }
+  return undefined
+}
+
+/** `local-192-168-0-119-8000` —— 稳定、可读、能当路由名。 */
+export function autoProviderId(host, port, prefix = 'local') {
+  const slug = String(host).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '')
+  return `${prefix}-${slug || 'host'}-${port}`
+}
+
+/** 该端点所有**已知**上下文里最小的那个 —— 新 provider 的安全兜底值。 */
+export function safeDefaultContext(models) {
+  const known = models.map((m) => m.contextWindow).filter((n) => Number.isInteger(n) && n > 0)
+  return known.length === 0 ? undefined : Math.min(...known)
+}
+
+/**
+ * 合并一条 provider。
+ * **机器说了算的只有 contextWindow / maxTokens，其余已有值一律不动。**
+ * @returns `{ profile, skipped }`；`skipped` 是「拒绝自动新建」的模型条目（上下文未知）。
+ */
+export function mergeProfile(discovered, existing, naming, config) {
+  const previous = existing && typeof existing === 'object' ? existing : {}
+  const isNew = existing === undefined
+  const profile = { ...previous }
+  const skipped = []
+  const fallbackContext = safeDefaultContext(discovered.models)
+
+  if (isNew) {
+    // 新建时只写「不写就不对」的字段。
+    profile.api = 'openai-completions'
+    const compat = localCompat(discovered.engine)
+    if (compat !== undefined) profile.compat = compat
+    profile.streamIdleTimeoutMs = config.streamIdleTimeoutMs
+    if (naming.apiKeyEnv !== '') profile.apiKeyEnv = naming.apiKeyEnv
+    // 兜底不再是 262144：缺 contextWindow 的条目最多按这个端点已知的最小上下文算。
+    if (fallbackContext !== undefined) profile.defaultContextWindow = fallbackContext
+  }
+  profile.baseURL = discovered.baseURL
+  if (asString(profile.displayName) === '' && naming.displayName !== '') profile.displayName = naming.displayName
+
+  // ── 模型数组：并集语义 ──
+  const declared = Array.isArray(previous.models) ? previous.models : []
+  const byId = new Map(declared.filter((m) => m && typeof m === 'object' && m.id).map((m) => [m.id, m]))
+  const merged = []
+  const seen = new Set()
+
+  for (const found of discovered.models) {
+    const prior = byId.get(found.id)
+    seen.add(found.id)
+
+    if (prior === undefined) {
+      const cw = found.contextWindow ?? (fallbackContext !== undefined && config.adoptUnknownContext ? fallbackContext : undefined)
+      if (cw === undefined) {
+        skipped.push({ id: found.id, reason: found.trainContext === undefined
+          ? '引擎没报上下文长度'
+          : `引擎只报了训练长度 ${found.trainContext}（不等于服务端上限），不猜` })
+        continue
+      }
+      const mt = found.maxTokens ?? config.defaultMaxTokens
+      merged.push({ id: found.id, name: found.name || found.id, contextWindow: cw, maxTokens: Math.min(mt, cw) })
+      continue
+    }
+
+    const entry = { ...prior }
+    if (asString(entry.name) === '') entry.name = found.name || found.id
+    const cw = found.contextWindow ?? (Number.isInteger(entry.contextWindow) ? entry.contextWindow : undefined)
+    if (cw !== undefined) {
+      entry.contextWindow = cw
+      // maxTokens 是**请求时**的最大输出，必须留在上下文之内，否则长提示必然越界。
+      const mt = Number.isInteger(entry.maxTokens) ? entry.maxTokens : (found.maxTokens ?? config.defaultMaxTokens)
+      entry.maxTokens = Math.min(mt, cw)
+    } else if (entry.maxTokens === undefined && found.maxTokens !== undefined) {
+      entry.maxTokens = found.maxTokens
+    }
+    merged.push(entry)
+  }
+
+  // 只增不删：引擎没广告的旧条目保留（可能是手写但当前档位暂未服务的）。
+  if (!config.prune) {
+    for (const [id, entry] of byId) if (!seen.has(id)) merged.push(entry)
+  }
+
+  profile.models = merged
+  return { profile, skipped }
+}
+
+/** 本地端点的 compat 偏置：这些引擎不认 `max_completion_tokens`。 */
+function localCompat(engine) {
+  if (engine === 'vllm' || engine === 'sglang' || engine === 'llama.cpp') {
+    return { maxTokensField: 'max_tokens' }
+  }
+  return undefined
+}
+
+/** 逐字段对比两条 provider，产出给人看的 diff 行（只比本插件会碰的字段）。 */
+export function diffProfile(before, after) {
+  const changes = []
+  const created = before === undefined
+  const prev = before ?? {}
+
+  for (const field of ['baseURL', 'displayName', 'api', 'streamIdleTimeoutMs', 'defaultContextWindow']) {
+    if (created) {
+      if (after[field] !== undefined) changes.push({ field, from: null, to: after[field] })
+    } else if (prev[field] !== after[field]) {
+      changes.push({ field, from: prev[field] ?? null, to: after[field] ?? null })
+    }
+  }
+
+  const beforeModels = new Map((Array.isArray(prev.models) ? prev.models : []).map((m) => [m?.id, m]))
+  const afterModels = new Map((after.models ?? []).map((m) => [m.id, m]))
+
+  for (const [id, next] of afterModels) {
+    const prior = beforeModels.get(id)
+    if (prior === undefined) {
+      changes.push({ id, field: '(新增模型)', from: null, to: next.contextWindow ?? null })
+      continue
+    }
+    for (const field of ['name', 'contextWindow', 'maxTokens']) {
+      if (prior[field] !== next[field]) {
+        changes.push({ id, field, from: prior[field] ?? null, to: next[field] ?? null })
+      }
+    }
+  }
+  for (const [id, prior] of beforeModels) {
+    if (!afterModels.has(id)) {
+      changes.push({ id, field: '(移除模型)', from: prior.contextWindow ?? null, to: null })
+    }
+  }
+  return changes
+}
+
+/** 自动压缩阈值安全性：0.8 × contextWindow 之上还要塞得下 maxTokens。 */
+export function compactionHeadroom(contextWindow, maxTokens, ratio = 0.8) {
+  if (!Number.isFinite(contextWindow) || contextWindow <= 0) return null
+  const threshold = Math.floor(contextWindow * ratio)
+  const mt = Number.isFinite(maxTokens) && maxTokens > 0 ? maxTokens : 0
+  return { ratio, threshold, maxTokens: mt, headroom: contextWindow - threshold - mt }
+}
+
+/**
+ * 由探测结果算出「这个端点该用哪个 provider 路由名」。
+ * 优先级：baseURL 已存在的 provider > 命名配置（只给第一个命中者）> 自动名。
+ */
+export function pickProviderId(discovered, existingByOrigin, naming, config, taken) {
+  const existing = existingByOrigin.get(discovered.origin)
+  if (existing !== undefined) return existing
+
+  if (naming.providerId !== '' && !taken.has(naming.providerId)) return naming.providerId
+
+  let host = discovered.host
+  try { host = new URL(discovered.origin).hostname } catch { /* 用 discovered.host 兜底 */ }
+  const base = autoProviderId(host, discovered.port)
+  let candidate = base
+  let n = 2
+  while (taken.has(candidate)) candidate = `${base}-${n++}`
+  return candidate
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// 网络探测
+// ─────────────────────────────────────────────────────────────────────────
+
+async function getJson(url, timeoutMs) {
+  const response = await fetch(url, {
+    method: 'GET',
+    headers: { accept: 'application/json' },
+    signal: AbortSignal.timeout(timeoutMs)
+  })
+  const status = response.status
+  if (!response.ok) {
+    const error = new Error(`${url} 回了 ${status}`)
+    error.status = status
+    throw error
+  }
+  return { status, body: await response.json() }
+}
+
+/** 有并发上限的 map —— 一台机器超时不该拖住其余全部。 */
+async function mapLimited(items, limit, worker) {
+  const out = new Array(items.length)
+  let cursor = 0
+  const runners = new Array(Math.min(limit, items.length)).fill(null).map(async () => {
+    for (;;) {
+      const index = cursor++
+      if (index >= items.length) return
+      out[index] = await worker(items[index], index)
+    }
+  })
+  await Promise.all(runners)
+  return out
+}
+
+/**
+ * 探一个端点：`/v1/models` 拿模型与上下文，缺上下文时按引擎补 `/props` 或 `/api/show`。
+ * 任何失败都收成 `{ reachable:false, error }`，绝不抛。
+ */
+export async function probeTarget(target, config) {
+  const started = Date.now()
+  const base = { baseURL: target.baseURL, origin: target.origin, host: target.host, port: target.port }
+  let listing
+  try {
+    listing = await getJson(`${target.baseURL}/models`, config.probeTimeoutMs)
+  } catch (error) {
+    return { ...base, reachable: false, status: error.status ?? null, latencyMs: Date.now() - started, error: msg(error) }
+  }
+
+  const latencyMs = Date.now() - started
+  let models
+  try {
+    models = parseListing(listing.body)
+  } catch (error) {
+    return { ...base, reachable: true, status: listing.status, latencyMs, error: `列表读不动：${msg(error)}` }
+  }
+  if (models.length === 0) {
+    return { ...base, reachable: true, status: listing.status, latencyMs, models: [], engine: 'unknown' }
+  }
+
+  let engine = detectEngine(models)
+
+  // 上下文缺失时补一次。llama.cpp 只有 `/props` 说得出服务端 `-c` 实参
+  // （`/v1/models` 的 `n_ctx_train` 是训练长度，已在 parseListing 里单独隔离）。
+  if (models.some((m) => m.contextWindow === undefined)) {
+    const props = await tryProps(target.origin, config)
+    if (props !== null) {
+      engine = 'llama.cpp'
+      const nCtx = readNumber(props, [['default_generation_settings', 'n_ctx'], ['n_ctx']])
+      for (const model of models) {
+        if (model.contextWindow === undefined && nCtx !== undefined) model.contextWindow = nCtx
+        model.sawProps = true
+      }
+    }
+  }
+  if (models.some((m) => m.contextWindow === undefined) && engine === 'unknown') {
+    // 可能是 Ollama：`/api/show` 逐模型问一次。
+    for (const model of models) {
+      if (model.contextWindow !== undefined) continue
+      const show = await tryShow(target.origin, model.id, config)
+      if (show !== null) {
+        engine = 'ollama'
+        model.contextWindow = contextFromShow(show) ?? model.contextWindow
+      }
+    }
+  }
+
+  return {
+    ...base,
+    reachable: true,
+    status: listing.status,
+    latencyMs,
+    engine,
+    models: models.map(({ id, name, contextWindow, trainContext, maxTokens }) => ({
+      id,
+      name,
+      ...(contextWindow === undefined ? {} : { contextWindow }),
+      ...(trainContext === undefined ? {} : { trainContext }),
+      ...(maxTokens === undefined ? {} : { maxTokens })
+    }))
+  }
+}
+
+async function tryProps(origin, config) {
+  try {
+    return (await getJson(`${origin}/props`, config.probeTimeoutMs)).body
+  } catch {
+    return null
+  }
+}
+
+async function tryShow(origin, modelId, config) {
+  try {
+    const response = await fetch(`${origin}/api/show`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', accept: 'application/json' },
+      body: JSON.stringify({ model: modelId, name: modelId }),
+      signal: AbortSignal.timeout(config.probeTimeoutMs)
+    })
+    if (!response.ok) return null
+    return await response.json()
+  } catch {
+    return null
+  }
+}
+
+/** `/health`：vLLM / SGLang / llama.cpp 都有；拿不到就记 ok:false，不算致命。 */
+async function probeHealth(origin, config) {
+  try {
+    const response = await fetch(`${origin}/health`, {
+      method: 'GET',
+      signal: AbortSignal.timeout(config.probeTimeoutMs)
+    })
+    return { ok: response.ok, status: response.status }
+  } catch (error) {
+    return { ok: false, status: null, error: msg(error) }
+  }
+}
+
+/** 凭据名必须长成 POSIX 环境变量名，否则 `credentialRef` 会抛（与 dsh-credentials 同一条正则）。 */
+const CREDENTIAL_REF = /^[A-Za-z_][A-Za-z0-9_]*$/
+
+/**
+ * 判一个 `apiKeyEnv` 取不取得到值。口径与 `dsh-llm-pi-ai` 的 `resolveApiKey` 对齐
+ * （先凭据服务、后启动环境），因为它抛不抛 MISSING_CREDENTIAL 就是这个判据。
+ * @returns `{ state: 'none'|'ok'|'missing'|'unknown', from?, note? }`
+ */
+export async function credentialStatus(ctx, ref) {
+  if (ref === '') return { state: 'none' }
+  if (!CREDENTIAL_REF.test(ref)) return { state: 'missing', note: `"${ref}" 不是合法的凭据名（须匹配 ${String(CREDENTIAL_REF)}）` }
+
+  let serviceChecked = false
+  try {
+    const credentials = ctx?.get?.('credentials')
+    if (credentials !== undefined && typeof credentials.resolve === 'function') {
+      serviceChecked = true
+      const hit = await credentials.resolve(ref)
+      if (hit !== undefined && typeof hit.value === 'string' && hit.value.length > 0) {
+        return { state: 'ok', from: '凭据服务' }
+      }
+    }
+  } catch (error) {
+    return { state: 'unknown', note: `查凭据服务出错：${msg(error)}` }
+  }
+
+  const ambient = process.env[ref]
+  if (typeof ambient === 'string' && ambient.length > 0) return { state: 'ok', from: '环境变量' }
+  if (!serviceChecked) return { state: 'unknown', note: '没有可用的凭据服务，只查了环境变量' }
+  return { state: 'missing', note: '凭据服务与环境变量里都没有取到值' }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// 候选端点收集
+// ─────────────────────────────────────────────────────────────────────────
+
+/**
+ * 种子主机 × 端口，去重后按「用户写的顺序」返回 —— 顺序有意义：
+ * 第一个命中的端点会拿到固定的 `providerId`。
+ */
+export function candidateTargets(config, section) {
+  const targets = []
+  const seen = new Set()
+
+  const push = (host, port) => {
+    const origin = `http://${host}:${port}`
+    if (seen.has(origin)) return
+    seen.add(origin)
+    targets.push({ baseURL: `${origin}/v1`, origin, host, port })
+  }
+
+  for (const host of config.hosts) for (const port of config.ports) push(host, port)
+
+  if (config.includeConfigured) {
+    // 已经配好的内网 provider：把它的 host:port 也纳入刷新（用户已经声明过它们，
+    // 不算「扫新主机」）。公网端点不纳。
+    for (const provider of Object.values(section?.providers ?? {})) {
+      const origin = originOf(asString(provider?.baseURL))
+      if (origin === null || !isPrivate(origin)) continue
+      try {
+        const url = new URL(origin)
+        push(url.hostname, Number(url.port || (url.protocol === 'https:' ? 443 : 80)))
+      } catch { /* originOf 已经挡过坏输入，这里只是不给它第二次机会 */ }
+    }
+  }
+  return targets
+}
+
+/** 现有 provider 按 origin 建索引，用来「复用而不是新建」。 */
+export function indexProvidersByOrigin(section) {
+  const map = new Map()
+  for (const [providerId, provider] of Object.entries(section?.providers ?? {})) {
+    const origin = originOf(asString(provider?.baseURL))
+    if (origin !== null && !map.has(origin)) map.set(origin, providerId)
+  }
+  return map
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// 接入（run）
+// ─────────────────────────────────────────────────────────────────────────
+
+/** 单飞：自动探测与手动点击可能重叠，重叠会让同一次改动被写两遍。 */
+let inFlight = null
+/** 最近一次的报告缓存，供页面 `/state` 免网络读取。 */
+const cache = { run: null, selfCheck: null }
+
+async function probeAll(config, section) {
+  const targets = candidateTargets(config, section)
+  const results = await mapLimited(targets, config.concurrency, (target) => {
+    if (!config.allowPublic && !isPrivate(target.baseURL)) {
+      return { ...target, skipped: '不是内网端点（allowPublic=false）' }
+    }
+    return probeTarget(target, config)
+  })
+  return { targets, results }
+}
+
+/**
+ * 发现 + 接入。写设置是逐 provider 的：一条失败不影响其余，且只回报不回滚。
+ * @param options.dryRun - true 时只算不写（`?dry=1`）。
+ */
+async function runConnect(ctx, config, options = {}) {
+  const section = ctx.settings.section(NS) ?? {}
+  const dryRun = options.dryRun === true
+  const { targets, results } = await probeAll(config, section)
+
+  const existingByOrigin = indexProvidersByOrigin(section)
+  const taken = new Set(Object.keys(section.providers ?? {}))
+  const naming = { providerId: config.providerId, displayName: config.displayName, apiKeyEnv: config.apiKeyEnv }
+  const providers = []
+  let wrote = false
+
+  for (const found of results) {
+    if (found.skipped !== undefined || found.reachable !== true) continue
+    if (!Array.isArray(found.models) || found.models.length === 0) continue
+
+    const providerId = pickProviderId(found, existingByOrigin, naming, config, taken)
+    const existing = section.providers?.[providerId]
+    const displayName = asString(existing?.displayName) !== ''
+      ? existing.displayName
+      : (providerId === config.providerId && config.displayName !== '' ? config.displayName : `${providerId}（本地）`)
+
+    const { profile, skipped } = mergeProfile(found, existing, { ...naming, displayName }, config)
+    const changes = diffProfile(existing, profile)
+    const action = existing === undefined ? 'created' : (changes.length > 0 ? 'updated' : 'unchanged')
+
+    if (skipped.length > 0) {
+      // 全部被拒 → 不建一个空 provider（空 models 会被 llm-pi-ai 判为「resolves no models」直接报错）。
+      if ((profile.models ?? []).length === 0) {
+        providers.push({
+          provider: providerId,
+          baseURL: found.baseURL,
+          action: 'skipped',
+          changes: [],
+          skipped,
+          error: `广告的 ${found.models.length} 个模型上下文都读不到，未建 provider（要强行建请设 adoptUnknownContext: true）`
+        })
+        continue
+      }
+    }
+
+    // 先判「有没有变化」，再判 dry-run —— 否则 dry-run 会把已经最新的 provider
+    // 也报成「待写入」，读的人以为每次都有东西要改。
+    if (changes.length === 0) {
+      providers.push({ provider: providerId, baseURL: found.baseURL, action, changes, ...(skipped.length ? { skipped } : {}) })
+      taken.add(providerId)
+      continue
+    }
+    if (dryRun) {
+      providers.push({ provider: providerId, baseURL: found.baseURL, action: 'would-change', changes, ...(skipped.length ? { skipped } : {}) })
+      taken.add(providerId)
+      continue
+    }
+
+    try {
+      await ctx.settings.mutate(NS, [{ op: 'set', path: ['providers', providerId], value: profile }])
+      wrote = true
+      taken.add(providerId)
+      providers.push({ provider: providerId, baseURL: found.baseURL, action, changes, ...(skipped.length ? { skipped } : {}) })
+    } catch (error) {
+      providers.push({ provider: providerId, baseURL: found.baseURL, action: 'failed', changes, error: msg(error) })
+    }
+  }
+
+  const report = {
+    ok: providers.every((p) => p.action !== 'failed'),
+    at: new Date().toISOString(),
+    version: VERSION,
+    dryRun,
+    wrote,
+    candidates: targets.map((t) => `${t.host}:${t.port}`),
+    targets: results,
+    providers
+  }
+  cache.run = report
+  return report
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// 自检（selfcheck）—— 只读，一个字节都不写
+// ─────────────────────────────────────────────────────────────────────────
+
+/**
+ * 逐条判。每条 check 都有稳定的 id、ok/warn/fail 三档、以及给人看的一句话。
+ * 判定口径全部落在「可复现的事实」上，不做主观评价。
+ */
+async function selfCheck(ctx, config) {
+  const section = ctx.settings.section(NS) ?? {}
+  const checks = []
+  const add = (id, level, title, detail) => checks.push({ id, level, title, detail })
+
+  add('plugin', 'ok', `插件已加载 v${VERSION}`,
+    `命名空间 ${NS}；自动探测 ${config.autoProbe ? '开' : '关'}，自动写入 ${config.autoApply ? '开' : '关'}`)
+
+  const { targets, results } = await probeAll(config, section)
+  const live = results.filter((r) => r.reachable === true)
+  const withModels = live.filter((r) => Array.isArray(r.models) && r.models.length > 0)
+
+  add('targets', live.length > 0 ? 'ok' : 'fail', `候选端点 ${targets.length} 个，存活 ${live.length} 个`,
+    targets.map((t) => `${t.host}:${t.port}`).join('、') || '（没有任何候选）')
+  if (live.length === 0) {
+    add('reachability', 'fail', '一个候选端点都没通',
+      `种子主机 ${config.hosts.join('、')}，端口 ${config.ports.join('、')}；确认 GPU 上 modelctl status 且与本机同网段`)
+  }
+
+  const targetRows = []
+  for (const result of results) {
+    if (result.skipped !== undefined || result.reachable !== true) {
+      targetRows.push({ ...result, health: null })
+      continue
+    }
+    const health = await probeHealth(result.origin, config)
+    targetRows.push({ ...result, health })
+    for (const model of result.models ?? []) {
+      const cw = model.contextWindow
+      add(`model:${result.host}:${result.port}/${model.id}`, cw === undefined ? 'warn' : 'ok',
+        `${result.host}:${result.port} · ${model.id}`,
+        cw === undefined
+          ? `引擎（${result.engine ?? 'unknown'}）没给出可用的上下文长度${model.trainContext === undefined ? '' : `，只有训练长度 ${model.trainContext}（不等于服务端上限，故不采用）`}`
+          : `上下文 ${cw}，引擎识别为 ${result.engine ?? 'unknown'}，${result.latencyMs}ms`)
+    }
+    if (result.error !== undefined) {
+      add(`probe:${result.host}:${result.port}`, 'warn', `${result.host}:${result.port} 探测异常`, String(result.error))
+    }
+    if (health.ok !== true) {
+      add(`health:${result.host}:${result.port}`, 'warn', `${result.host}:${result.port} 的 /health 不是 200`,
+        `status ${health.status ?? '（连不上）'}；/v1/models 能读但仍建议查 modelctl status`)
+    }
+  }
+
+  if (withModels.length === 0 && live.length > 0) {
+    add('models', 'fail', '端点通了但没读到任何模型', '引擎可能还在加载权重（启动 90–210 秒），或 /v1/models 未就绪')
+  }
+
+  // ── 声明 vs 引擎：这是本插件存在的理由，判据要最严 ──
+  const existingByOrigin = indexProvidersByOrigin(section)
+  const linked = new Set()
+  for (const result of withModels) {
+    const providerId = existingByOrigin.get(result.origin)
+    if (providerId === undefined) {
+      add(`link:${result.origin}`, 'warn', `${result.origin} 还没接进模型列表`,
+        `点「接入本地模型」即可建出 provider；当前广告 ${result.models.length} 个模型`)
+      continue
+    }
+    const provider = section.providers?.[providerId] ?? {}
+    const declared = new Map((Array.isArray(provider.models) ? provider.models : []).map((m) => [m?.id, m]))
+    linked.add(providerId)
+
+    for (const found of result.models) {
+      const entry = declared.get(found.id)
+      if (entry === undefined) {
+        add(`declare:${providerId}/${found.id}`, 'warn', `${providerId} 里没有 ${found.id}`,
+          `引擎在 ${result.origin} 广告了它${found.contextWindow === undefined ? '' : `（上下文 ${found.contextWindow}）`}`)
+        continue
+      }
+      const declaredCw = Number(entry.contextWindow)
+      if (found.contextWindow !== undefined && declaredCw !== found.contextWindow) {
+        add(`context:${providerId}/${found.id}`, 'warn', `${providerId}/${found.id} 的上下文对不上`,
+          `声明 ${Number.isFinite(declaredCw) ? declaredCw : '缺'}，引擎自报 ${found.contextWindow}（跑一次「接入本地模型」即修正）`)
+        continue
+      }
+      if (!Number.isFinite(declaredCw)) {
+        add(`context-missing:${providerId}/${found.id}`, 'warn', `${providerId}/${found.id} 缺 contextWindow`,
+          '缺这个字段会让自动压缩阈值回落到 0.8 × 262144')
+        continue
+      }
+      const head = compactionHeadroom(declaredCw, Number(entry.maxTokens))
+      if (head !== null && head.headroom < 0) {
+        // maxTokens 是使用偏好而不是引擎事实，本插件不替你改；但要给出能塞下的最大值。
+        add(`headroom:${providerId}/${found.id}`, 'fail', `${providerId}/${found.id} 的压缩阈值不够塞`,
+          `0.8 × ${declaredCw} = ${head.threshold}，加 maxTokens ${head.maxTokens} 超过上下文 ${-head.headroom} token；` +
+          `把 maxTokens 降到 ${Math.max(1, declaredCw - head.threshold)} 或更小`)
+        continue
+      }
+      add(`ok:${providerId}/${found.id}`, 'ok', `${providerId}/${found.id} 声明与引擎一致`,
+        `上下文 ${declaredCw}${head === null ? '' : `，压缩阈值 ${head.threshold}，余量 ${head.headroom}`}`)
+    }
+
+    for (const id of declared.keys()) {
+      if (!result.models.some((m) => m.id === id)) {
+        add(`stale:${providerId}/${id}`, 'warn', `${providerId} 里的 ${id} 引擎当前没有`,
+          `${result.origin} 只广告 ${result.models.map((m) => m.id).join('、')}；默认不删（prune=${config.prune}）`)
+      }
+    }
+  }
+
+  const unlinked = withModels.filter((r) => existingByOrigin.get(r.origin) === undefined)
+  add('linkage', unlinked.length === 0 ? 'ok' : 'warn',
+    `已接入 provider ${linked.size} 个，待接入端点 ${unlinked.length} 个`,
+    unlinked.length === 0 ? '所有有模型的端点都在模型列表里' : unlinked.map((r) => r.origin).join('、'))
+
+  // ── 凭据可解析性 ──
+  // 声明了 `apiKeyEnv` 却取不到值，会让这个 provider **在发请求时**抛 MISSING_CREDENTIAL
+  // —— 配置本身合法、schema 也过，只有在用时才炸。这条最值得自检。
+  // 口径见 credentialStatus；只查内网端点（本插件的范围）。
+  let declaredCredentials = 0
+  let credentialsOk = true
+  for (const [providerId, provider] of Object.entries(section.providers ?? {})) {
+    if (!isPrivate(asString(provider?.baseURL))) continue
+    const ref = asString(provider?.apiKeyEnv)
+    if (ref === '') continue
+    declaredCredentials++
+    const status = await credentialStatus(ctx, ref)
+    if (status.state === 'ok') continue
+    credentialsOk = false
+    add(`credential:${providerId}`, status.state === 'missing' ? 'fail' : 'warn',
+      `${providerId} 的凭据 ${ref} 取不到值`,
+      `${status.note ?? ''}；用这个模型时会报 MISSING_CREDENTIAL。修法三选一：在 Models 页存一次 ${ref}、把 ${ref} 导出到 dsh web 的环境、` +
+      `或删掉该 provider 的 apiKeyEnv（本地端点通常不需要鉴权）`)
+  }
+  if (declaredCredentials > 0 && credentialsOk) {
+    add('credentials', 'ok', `${declaredCredentials} 个本地 provider 的凭据都能取到值`, '解析口径与 dsh-llm-pi-ai 的 resolveApiKey 一致')
+  }
+
+  const verdict = checks.some((c) => c.level === 'fail') ? 'fail' : (checks.some((c) => c.level === 'warn') ? 'warn' : 'ok')
+  const report = {
+    ok: verdict !== 'fail',
+    verdict,
+    at: new Date().toISOString(),
+    version: VERSION,
+    config: {
+      hosts: config.hosts,
+      ports: config.ports,
+      providerId: config.providerId,
+      includeConfigured: config.includeConfigured,
+      autoProbe: config.autoProbe,
+      autoApply: config.autoApply,
+      prune: config.prune,
+      adoptUnknownContext: config.adoptUnknownContext,
+      probeTimeoutMs: config.probeTimeoutMs
+    },
+    summary: {
+      candidates: targets.length,
+      reachable: live.length,
+      withModels: withModels.length,
+      models: withModels.reduce((n, r) => n + r.models.length, 0),
+      linkedProviders: linked.size,
+      pendingEndpoints: unlinked.length,
+      ok: checks.filter((c) => c.level === 'ok').length,
+      warn: checks.filter((c) => c.level === 'warn').length,
+      fail: checks.filter((c) => c.level === 'fail').length
+    },
+    targets: targetRows,
+    checks
+  }
+  cache.selfCheck = report
+  return report
+}
+
+/** 单飞包装：同一时刻只允许一次网络全扫。 */
+function singleFlight(job) {
+  if (inFlight !== null) return inFlight
+  inFlight = Promise.resolve().then(job).finally(() => { inFlight = null })
+  return inFlight
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// 页面脚本（注入 index.html）
+// ─────────────────────────────────────────────────────────────────────────
+
+/**
+ * 样式走独立的 `style` 行、脚本走 `script` 行 —— 不再把 CSS 塞进模板字符串里，
+ * 省掉 v1 那种 `\`` 转义（改一个颜色都要数反斜杠）。
+ */
+const PANEL_STYLE = `
+#lmc-panel { position: fixed; right: 18px; bottom: 18px; z-index: 2147483000;
+  display: flex; flex-direction: column; align-items: flex-end; gap: 6px;
+  font: 12px/1.45 -apple-system, "SF Pro Text", "Segoe UI", "Helvetica Neue", sans-serif; }
+#lmc-panel .lmc-row { display: flex; gap: 6px; align-items: center; }
+#lmc-panel button { cursor: pointer; border: 1px solid rgba(127,127,127,.45); border-radius: 999px;
+  padding: 7px 14px; background: rgba(28,28,30,.86); color: #f2f2f7; opacity: .55;
+  transition: opacity .15s ease, transform .1s ease; backdrop-filter: blur(6px); }
+#lmc-panel:hover button { opacity: 1; }
+#lmc-panel button:active { transform: scale(.97); }
+#lmc-panel button[disabled] { cursor: progress; opacity: 1; }
+#lmc-panel .lmc-dot { width: 9px; height: 9px; border-radius: 50%; background: #8e8e93;
+  box-shadow: 0 0 0 3px rgba(28,28,30,.55); }
+#lmc-panel .lmc-dot.ok { background: #30d158; }
+#lmc-panel .lmc-dot.warn { background: #ffd60a; }
+#lmc-panel .lmc-dot.fail { background: #ff453a; }
+#lmc-panel .lmc-box { max-width: min(62vw, 620px); max-height: 46vh; overflow: auto; text-align: left;
+  padding: 9px 11px; border-radius: 10px; background: rgba(28,28,30,.94); color: #f2f2f7;
+  white-space: pre-wrap; word-break: break-word; display: none;
+  font-family: ui-monospace, Menlo, Consolas, monospace; }
+#lmc-panel .lmc-box.show { display: block; }
+`
+
+const PANEL_SCRIPT = `(() => {
+  const ID = 'lmc-panel';
+  const API = {
+    state: ${JSON.stringify(ROUTE_STATE)},
+    run: ${JSON.stringify(ROUTE_RUN)},
+    selfcheck: ${JSON.stringify(ROUTE_SELFCHECK)}
+  };
+  if (window.__localModelsConnectInstalled) return;
+  window.__localModelsConnectInstalled = true;
+
+  let dot, box, runButton, checkButton;
+
+  function say(text) {
+    if (!box) return;
+    box.textContent = text;
+    box.classList.add('show');
+  }
+
+  function setStatus(level, title) {
+    if (!dot) return;
+    dot.className = 'lmc-dot' + (level ? ' ' + level : '');
+    dot.title = title || '';
+  }
+
+  async function post(url) {
+    const response = await fetch(url, { method: 'POST', headers: { accept: 'application/json' } });
+    return await response.json();
+  }
+
+  function renderRun(report) {
+    if (!report) return '没有返回';
+    if (report.error) return '出错了：' + report.error;
+    const lines = ['接入检查 @ ' + (report.at || '') + (report.dryRun ? '（dry-run，未写入）' : '')];
+    for (const t of report.targets || []) {
+      const at = (t.host || '?') + ':' + (t.port || '?');
+      if (t.skipped) { lines.push('· ' + at + ' 跳过：' + t.skipped); continue; }
+      if (!t.reachable) { lines.push('· ' + at + ' 不通：' + (t.error || '未知')); continue; }
+      const models = (t.models || []).map(function (m) {
+        return m.id + (m.contextWindow ? '@' + m.contextWindow : '@上下文未知');
+      }).join('，');
+      lines.push('· ' + at + ' [' + (t.engine || 'unknown') + '] ' + (models || '（没广告模型）'));
+    }
+    for (const p of report.providers || []) {
+      if (p.error) { lines.push('✗ ' + p.provider + '：' + p.error); continue; }
+      if (p.action === 'unchanged') { lines.push('= ' + p.provider + '：已是最新'); continue; }
+      if (p.action === 'would-change') { lines.push('~ ' + p.provider + '：待写入 ' + p.changes.length + ' 处'); continue; }
+      const c = (p.changes || []).map(function (x) {
+        return (x.id ? x.id + ' 的 ' : '') + x.field + ' ' + x.from + ' → ' + x.to;
+      }).join('；');
+      lines.push((p.action === 'created' ? '+ ' : '↑ ') + p.provider + '：' + (c || '无变化'));
+    }
+    const dropped = [];
+    for (const p of report.providers || []) {
+      for (const s of p.skipped || []) dropped.push(p.provider + '/' + s.id + '（' + s.reason + '）');
+    }
+    if (dropped.length > 0) lines.push('未采纳：' + dropped.join('；'));
+    lines.push(report.wrote ? '已写入设置（settings 热重载）' : '未写入设置');
+    return lines.join('\\n');
+  }
+
+  function renderCheck(report) {
+    if (!report) return '没有返回';
+    if (report.error) return '出错了：' + report.error;
+    const s = report.summary || {};
+    const icon = { ok: '✓', warn: '!', fail: '✗' };
+    const lines = ['自检 ' + String(report.verdict).toUpperCase() + ' @ ' + report.at,
+      '候选 ' + s.candidates + ' · 存活 ' + s.reachable + ' · 有模型 ' + s.withModels +
+      ' · 已接入 ' + s.linkedProviders + ' · 待接入 ' + s.pendingEndpoints,
+      '通过 ' + s.ok + ' · 提醒 ' + s.warn + ' · 失败 ' + s.fail, ''];
+    for (const c of report.checks || []) {
+      lines.push((icon[c.level] || '·') + ' ' + c.title);
+      if (c.detail && c.level !== 'ok') lines.push('    ' + c.detail);
+    }
+    return lines.join('\\n');
+  }
+
+  function build() {
+    if (document.getElementById(ID) || !document.body) return;
+    const host = document.createElement('div');
+    host.id = ID;
+
+    box = document.createElement('div');
+    box.className = 'lmc-box';
+
+    const row = document.createElement('div');
+    row.className = 'lmc-row';
+    dot = document.createElement('span');
+    dot.className = 'lmc-dot';
+    dot.title = '本地模型接入自检状态';
+
+    checkButton = document.createElement('button');
+    checkButton.type = 'button';
+    checkButton.textContent = '自检';
+    checkButton.title = '只读检查：端点通不通、认出什么模型、声明与引擎对不对得上';
+    checkButton.addEventListener('click', function () {
+      invoke(checkButton, '自检中…', async function () {
+        const report = await post(API.selfcheck);
+        setStatus(report && report.verdict, '最近一次自检：' + (report && report.verdict));
+        say(renderCheck(report));
+      });
+    });
+
+    runButton = document.createElement('button');
+    runButton.type = 'button';
+    runButton.textContent = '接入本地模型';
+    runButton.title = '扫描种子主机端口，把发现到的本地模型自动接进模型列表';
+    runButton.addEventListener('click', function () {
+      invoke(runButton, '接入中…', async function () {
+        const report = await post(API.run);
+        say(renderRun(report));
+        const check = await post(API.selfcheck);
+        setStatus(check && check.verdict, '自检：' + (check && check.verdict));
+      });
+    });
+
+    row.appendChild(dot);
+    row.appendChild(checkButton);
+    row.appendChild(runButton);
+    host.appendChild(box);
+    host.appendChild(row);
+    document.body.appendChild(host);
+
+    // 页面加载时只读缓存（不打网络）：插件开机自检跑过的话，状态点是热的。
+    fetch(API.state, { headers: { accept: 'application/json' } })
+      .then(function (r) { return r.json(); })
+      .then(function (state) {
+        if (state && state.lastSelfCheck) {
+          setStatus(state.lastSelfCheck.verdict,
+            '最近一次自检：' + state.lastSelfCheck.verdict + ' @ ' + state.lastSelfCheck.at);
+        }
+      })
+      .catch(function () {});
+  }
+
+  async function invoke(button, working, job) {
+    const original = button.textContent;
+    button.disabled = true;
+    button.textContent = working;
+    try {
+      await job();
+    } catch (error) {
+      say('请求失败：' + (error && error.message ? error.message : String(error)));
+      setStatus('fail', '请求失败');
+    } finally {
+      button.disabled = false;
+      button.textContent = original;
+    }
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build, { once: true });
+  } else {
+    build();
+  }
+  new MutationObserver(function () { if (document.body && !document.getElementById(ID)) build(); })
+    .observe(document.documentElement, { childList: true, subtree: true });
+})();`
+
+function injectPanel(table) {
+  table.push({ kind: 'style', text: PANEL_STYLE })
+  table.push({ kind: 'script', placement: 'head', text: PANEL_SCRIPT })
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// 宿主胶水
+// ─────────────────────────────────────────────────────────────────────────
+
+function sendJson(res, status, payload) {
+  const body = JSON.stringify(payload)
+  res.writeHead(status, {
+    'content-type': 'application/json; charset=utf-8',
+    'content-length': Buffer.byteLength(body),
+    'cache-control': 'no-store'
+  })
+  res.end(body)
+}
+
+export { runConnect, selfCheck, ROUTE_STATE, ROUTE_RUN, ROUTE_SELFCHECK, LEGACY_ROUTE_RUN, VERSION }
+
+export function apply(ctx, pluginConfig) {
+  const config = resolveConfig(pluginConfig)
+  ctx.logger.info(
+    'local-models-connect: v%s 就绪 —— 种子主机 %s，端口 %s',
+    VERSION, config.hosts.join('、'), config.ports.join('、')
+  )
+
+  const guard = (job) => async (req, res) => {
+    try {
+      sendJson(res, 200, await job(req))
+    } catch (error) {
+      ctx.logger.warn('local-models-connect: %s', msg(error))
+      sendJson(res, 200, { ok: false, error: msg(error) })
+    }
+  }
+
+  ctx.effect(() => ctx.webServer.register({
+    kind: 'exact',
+    path: ROUTE_STATE,
+    handler: guard(async () => ({
+      ok: true,
+      version: VERSION,
+      config: {
+        hosts: config.hosts,
+        ports: config.ports,
+        providerId: config.providerId,
+        displayName: config.displayName,
+        includeConfigured: config.includeConfigured,
+        autoProbe: config.autoProbe,
+        autoApply: config.autoApply,
+        prune: config.prune,
+        adoptUnknownContext: config.adoptUnknownContext,
+        probeTimeoutMs: config.probeTimeoutMs
+      },
+      lastRun: cache.run,
+      lastSelfCheck: cache.selfCheck
+    }))
+  }), 'local-models-connect: state route')
+
+  const runHandler = guard(async (req) => {
+    if (req.method !== 'POST') throw new Error(`${ROUTE_RUN} 只接受 POST（加 ?dry=1 可只看不写）`)
+    const dryRun = new URL(req.url ?? '/', 'http://localhost').searchParams.get('dry') === '1'
+    return await singleFlight(() => runConnect(ctx, config, { dryRun }))
+  })
+
+  ctx.effect(() => ctx.webServer.register({
+    kind: 'exact',
+    path: ROUTE_RUN,
+    handler: runHandler
+  }), 'local-models-connect: run route')
+
+  // v1 的旧路径留作别名：文档、脚本、肌肉记忆都还指着它。
+  ctx.effect(() => ctx.webServer.register({
+    kind: 'exact',
+    path: LEGACY_ROUTE_RUN,
+    handler: runHandler
+  }), 'local-models-connect: legacy run route')
+
+  ctx.effect(() => ctx.webServer.register({
+    kind: 'exact',
+    path: ROUTE_SELFCHECK,
+    handler: guard(async () => await singleFlight(() => selfCheck(ctx, config)))
+  }), 'local-models-connect: selfcheck route')
+
+  ctx.on('webserver/index-inject', injectPanel)
+
+  // 开机自动接入 —— 「新环境装上插件即可用」这一步就在这里。
+  if (config.autoProbe) {
+    ctx.effect(() => {
+      const timer = setTimeout(() => {
+        singleFlight(async () => {
+          const report = await runConnect(ctx, config, { dryRun: !config.autoApply })
+          const check = await selfCheck(ctx, config)
+          ctx.logger.info(
+            'local-models-connect: 自动接入 %s（%s）；自检 %s（ok %d / warn %d / fail %d）',
+            report.wrote ? '已写设置' : '未写设置',
+            report.providers.map((p) => `${p.provider}:${p.action}`).join(' ') || '无 provider',
+            check.verdict, check.summary.ok, check.summary.warn, check.summary.fail
+          )
+        }).catch((error) => ctx.logger.warn('local-models-connect: 自动探测失败：%s', msg(error)))
+      }, config.autoProbeDelayMs)
+      timer.unref?.()
+      return () => clearTimeout(timer)
+    }, 'local-models-connect: auto probe')
+  }
+}
