@@ -39,10 +39,10 @@ models:
 
 ## 3. 新一代：`local-models-connect.v1`
 
-源码：[`../dsh-plugin/local-models-connect.v1.mjs`](../dsh-plugin/local-models-connect.v1.mjs)
+源码：[`../dsh-plugin/local-models-connect.v3.mjs`](../dsh-plugin/local-models-connect.v3.mjs)
 测试：[`../dsh-plugin/tests/local-models-connect.test.mjs`](../dsh-plugin/tests/local-models-connect.test.mjs)（62 条，`node dsh-plugin/tests/local-models-connect.test.mjs`）
 
-装到 `~/.dsh/plugins/local-models-connect.v1.mjs`，并在
+装到 `~/.dsh/plugins/local-models-connect.v3.mjs`，并在
 `~/.dsh/profiles/web/cordis.patch.yml` 里挂一条（见 §6）。**它取代了 `local-models-sync.v1`**。
 
 它做三件事：
@@ -94,7 +94,7 @@ models:
 |---|---|---|
 | `plugin` | 版本、自动探测/自动写入开关 | ok |
 | `targets` | 候选端点总数 / 存活数 | 0 存活 → **fail** |
-| `reachability` | 一个都没通时给出种子主机与端口、并指向 `modelctl status` | **fail** |
+| `reachability` | 一个都没通时给出种子主机与端口、并指向 `modelctl status`；按连接层错误码区分「主机通但端口没监听」（`ECONNREFUSED`，多半在启动/重启窗口）与「连不上主机」 | **fail** |
 | `model:<host:port>/<id>` | 该模型有没有可用的上下文长度（有则报 `n_ctx_train` 作证据） | 无 → warn |
 | `health:<host:port>` | `/health` 是否 200 | 非 200 → warn |
 | `link:<origin>` | 端点有没有接进模型列表 | 没有 → warn |
@@ -103,7 +103,9 @@ models:
 | `context-missing:` | 声明里缺 `contextWindow`（会回落 262144） | → warn |
 | `headroom:<provider>/<id>` | `0.8 × contextWindow + maxTokens > contextWindow` | **fail**，并给出建议的 maxTokens 上限 |
 | `stale:<provider>/<id>` | 声明里有、引擎当前没广告 | → warn |
+| `linkage` | 汇总「已接入 / 待接入」 | 有待接入 → warn；**一个端点都没通时不给绿灯**（「已接入 0 个 / 待接入 0 个 ✓」是空转的 ✓），改报「无法判定」 |
 | `credential:<provider>` | `apiKeyEnv` 在凭据服务/环境变量里取不到值 | **fail**（用时会抛 `MISSING_CREDENTIAL`） |
+| `credentials` | 所有本地 provider 的 `apiKeyEnv` 都能取到值 | ok，但标题里明说**与端点是否连得通无关** |
 
 `verdict` = 有 fail 则 `fail`，否则有 warn 则 `warn`，否则 `ok`。
 
@@ -128,10 +130,22 @@ curl -sS "http://127.0.0.1:3080/local-models-connect/run?dry=1" -X POST | python
 curl -sS http://127.0.0.1:3080/local-models-connect/selfcheck | python3 -m json.tool
 ```
 
-页面上是右下角常驻的一小块：一个状态点（最近一次自检的 verdict）、「自检」与「接入本地模型」
-两个按钮、以及一个可滚动的报告区。样式走独立的 `style` 注入行、脚本走 `script` 行
-（v1 把 CSS 塞在模板字符串里，改一个颜色都要数反斜杠）。页面加载时只读 `/state` 的缓存，
-不打网络。
+页面上的两个按钮**挂在会话头部的 utilities 行里、「在本地打开」那个分体控件的左边**
+（同一个父容器、紧跟它前面；拿不到头部时退回右下角浮动，按钮不会凭空消失）：
+
+* 「自检」带一个状态点（最近一次自检的 verdict：绿/黄/红），「接入本地模型」没有；
+* 两个按钮走同一个工厂、同一个类名，度量照抄 `dsh-client-ui-open-in-app` 的
+  28px 高 / 14px 圆角 / `.5px` `border-l4` / 11px·16px 字 / 同 padding，
+  并复用同一批 `--dsw-alias-*` 令牌 —— 所以深浅色主题、hover、disabled 都跟着 DSH 走；
+* 报告弹窗是 `position: fixed`（**不参与布局、不顶开页面**），并且点它自己 / 按 Esc /
+  滚页面 / 超时（`autoHideMs`，默认 12 秒）都会收起。旧版把报告留在文档流里，
+  点一次就永久占一块地方 —— 2026-09-24 用户点名要改的就是这个。
+
+样式走独立的 `style` 注入行、脚本走 `script` 行（v1 把 CSS 塞在模板字符串里，改一个颜色
+都要数反斜杠）。页面加载时只读 `/state` 的缓存，不打网络。
+
+定位锚点用的是**行为特征**而不是哈希类名：找 `div[class*="_split"]` 里带
+`button[aria-haspopup="menu"]` 的那个（CSS module 的哈希随构建变，`_split` 这个本地名不变）。
 
 ## 5. v1 的实测记录（保留，作为「不能信手写声明」的第一手证据）
 
@@ -173,7 +187,7 @@ v1 只强制引擎**广告出来的事实**（`contextWindow` / `maxTokens` 上�
 ```yaml
 - insert:
     - id: local-models-connect
-      name: "/home/lcy/.dsh/plugins/local-models-connect.v1.mjs"
+      name: "/home/lcy/.dsh/plugins/local-models-connect.v3.mjs"
       config:
         hosts: ['192.168.0.119']          # 种子主机：唯一的扫描范围，要加机器改这一行
         ports: [8080, 8000, 30000, 8081, 11434, 1234]
@@ -199,6 +213,7 @@ v1 只强制引擎**广告出来的事实**（`contextWindow` / `maxTokens` 上�
 | `defaultMaxTokens` | `16384` | 引擎没说最大输出时新条目的 `maxTokens` |
 | `allowPublic` | `false` | 是否允许探测公网端点 |
 | `autoProbeDelayMs` | `4000` | 自动探测的延迟（让 dsh web 先把页面服务起来） |
+| `autoHideMs` | `12000` | 报告弹窗自动收起的时间；`0` = 不自动收（仍可点掉 / 按 Esc） |
 
 `providerId` / `displayName` / `apiKeyEnv` 支持**显式写空**表示「关掉/自动命名」
 （写成 `''`、`false` 或 `null`）——「没写这个键」才走默认值。
@@ -228,7 +243,7 @@ curl -sS http://127.0.0.1:3080/local-models-connect/state | python3 -m json.tool
 ```bash
 cp ~/.dsh/profiles/web/cordis.patch.yml.bak-before-local-models-connect-<ts> \
    ~/.dsh/profiles/web/cordis.patch.yml
-rm ~/.dsh/plugins/local-models-connect.v1.mjs
+rm ~/.dsh/plugins/local-models-connect.v3.mjs
 ```
 
 `settings.yaml` 的写入是幂等的（值没变就不写），回滚插件不会把设置改回去。
@@ -251,6 +266,17 @@ Cordis 只在 `name`（也就是文件路径）变化时才重新 `import` 模�
 所以**改插件内容要装成新文件名**（`v2`、`v3`…）并改 `cordis.patch.yml` 里那一行；
 只重存同一个文件不会重新加载。
 
+2026-09-24 把这条**实测确认**了一遍，而且是在 `patchReload: live` 真正生效之后（见 §6）：
+
+| 动作 | `/state` 报的版本 | 结论 |
+|---|---|---|
+| 只改文件内容（版本号 1.0.0 → 1.1.0），patch 不动 | 仍 `1.0.0` | 内容改动**不会**重载，HMR 不管模块内容 |
+| 新文件名 + 改 patch 里那一行 | 立刻 `1.1.0`，路由全程 200 | patch 一变就重载，**不需要重启 dsh web** |
+
+所以 `~/.dsh/plugins/` 里那个软链指向仓库实体只解决「文件同步」，不解决「模块重载」——
+要生效仍须换文件名。仓库里只保留当前那一版（旧版交给 git 历史），否则 `v1`/`v2`/`v3`
+同目录很容易看错哪份是在跑的。
+
 ## 9. 2026-09-24 的实测（新一代）
 
 隔离验证（`DSH_HOME=/tmp/lmc-home`，一套只含 `dsh-base` + `dsh-web-app` 的临时 profile，
@@ -263,27 +289,67 @@ Cordis 只在 `name`（也就是文件路径）变化时才重新 `import` 模�
   `credential:scratch-qwen ... 凭据服务与环境变量里都没有取到值`（说明真凭据服务确实被查到了，
   不是降级成 unknown）；
 * 换成 `LMC_LIVE_KEY` 并从环境变量导出该名 → `verdict: ok`（`credentials` 那条 ok）；
-* 带 token 取 `/` → 渲染出的 HTML 里有注入的 `<style>`（`#lmc-panel …`）与面板脚本
+* 带 token 取 `/` → 渲染出的 HTML 里有注入的 `<style>`（`#lmc-tools` / `#lmc-box`）与面板脚本
   （`接入本地模型`、`__localModelsConnectInstalled`），且注入脚本里没有提前闭合的 `</script>`；
 * `POST /run?dry=1` → `wrote: false`，一个字节都没写。
 
-回归测试 62 条全过（纯逻辑 39 + 假引擎探测 5 + 端到端 17 + 实机冒烟 1 —— 数出来的是这样，
-不是估的）。真机 192.168.0.119:8080 冒烟：识别为 `vllm`，`Qwen3.8-27B-Q6-dual-5060ti`，上下文 150000。
+回归测试 65 条全过（纯逻辑 39 + 假引擎探测 5 + 端到端 18 + 面板契约 1 + 实机冒烟 1 —— 数出来的
+是这样，不是估的）。真机 192.168.0.119:8080 冒烟：识别为 `vllm`，`Qwen3.8-27B-Q6-dual-5060ti`，
+上下文 150000，KV 池 157,824（= 文档里那个数，见下面「一次误判」）。
 
 真机 `dsh web` 侧（`sudo systemctl restart dsh-web` 之后，PID 658997）：
 
-* `GET /state` → `version: 1.0.0`；开机自动探测已跑完：候选 6 个、存活 1 个（8080 → vllm /
-  `Qwen3.8-27B-Q6-dual-5060ti`@150000），`qwen-local: unchanged`、`wrote: false`
-  —— **没动那份手写声明**（它本来就对）；
+* `GET /state` → 版本与 `autoHideMs` 都对得上；开机自动探测已跑完：候选 6 个、存活 1 个
+  （8080 → vllm / `Qwen3.8-27B-Q6-dual-5060ti`@150000），`qwen-local: unchanged`、
+  `wrote: false` —— **没动那份手写声明**（它本来就对）；
 * `POST /selfcheck` → `verdict: ok`，6 条 ok / 0 warn / 0 fail，含「1 个本地 provider 的凭据
   都能取到值」（真凭据服务里确实有 `QWEN_LOCAL_API_KEY`）；
 * `POST /run?dry=1` → `qwen-local: unchanged`、`wrote: false`；
 * v1 旧路径 `/local-models-sync/run` → 200，且回的是**新**结构（`providers`，不再是 `results`）；
-* `settings.yaml` 的 md5 与安装前一致（`23c40e46…`）；
-* 右下角面板在**真浏览器**里驱动过一遍（拿插件现取的注入行 + 桩路由搭页，避免把 GUI 的 token
-  写进对话记录）：两个按钮都在、状态点从 `/state` 缓存热起、点「自检」渲染出 `WARN` 与逐条明细
-  且状态点转 `warn`、点「接入本地模型」渲染出目标/改动/未采纳/已写入四段、把面板节点删掉后
-  MutationObserver 重挂且不重复（1 个面板 / 1 个 style）、0 条 console 错误、
-  4 个 fetch 全是预期的那四个（state → selfcheck → run → selfcheck）。
+* `settings.yaml` 的 md5 与安装前一致（`23c40e46…`）。
+
+### 面板（2026-09-24，真浏览器实测）
+
+拿插件现取的注入行 + 桩页搭台驱动，避开把 GUI 的 token 写进对话记录；桩的头部形状
+（`div[class*="_split"]` 内含 `button[aria-haspopup=menu]`）与令牌值都抄自 DSH 自己的源码：
+
+* `#lmc-tools` 是分体控件的**紧邻前一个兄弟**（`tools.nextElementSibling === split`），
+  两者间距 8px —— 与头部自己的 items 间距一致；
+* 两个按钮计算样式完全相同：`28px | 14px | 11px | 16px | 5px 10px | flex | 1px`，
+  与原生分体控件容器同档（它也是 28px 高 / 14px 圆角 / `.5px` 边框渲染成 1px）；
+* 弹窗 `position: fixed`：展示前后头部高度都是 45、分体控件左边缘都是 243、
+  文档高度不变 —— **不顶开页面**；右边缘与按钮组右边缘**逐像素对齐**（1381 / 1381）；
+* 收起四条路都验过：点弹窗、按 Esc、超时（`autoHideMs`）、滚动页面；
+* 把 `#lmc-tools` 从 DOM 里删掉 → MutationObserver 300ms 后重挂，且**不重复**（1 个实例）；
+* 0 条 console 错误、请求全是预期的那几个。
+
+**踩到并修掉的一个真 bug**：弹窗原本用 `max-width` + shrink-to-fit，于是「可用宽度」会被上一次
+写下的 `left` 截断 —— 量到的是「剩下的空间」而不是内容宽度，每次重排都把弹窗再往左推一截
+（实测右边缘差了 **59px**）。改成 CSS 里写死 `width: min(72vw, 560px)` + `box-sizing: border-box`
+后，`offsetWidth` 与 `left` 无关，重复展示两次的 `left` 完全相同（821px = 1381 − 560）。
+
+### 一次误判：别把「别人的实验」当成「表过时了」
+
+`local-models-connect` 的自检在 09:16 前后报了 **6/6 端点不通**，看起来像服务没了；实测是
+**另一台控制机（192.168.0.107）上的会话正在把 GPU 机回滚 vLLM 0.30 → 0.29**：
+`/home/lcy/rollback_029.sh` 恢复 `~/.modelctl.env`、把 `vllm-current` 指回 `vllm-venv-029`、
+`systemctl restart modelctl`，期间端口本来就是关的。判据是 `systemctl show modelctl` 的
+`NRestarts=0` / `Result=success` —— **systemd 的 `Restart=always` 一次都没触发**，
+是外部的显式 `systemctl restart`。
+
+回滚完成（09:20:10）后 KV 池回到 **157,824**：所以中途看到的 `KVBYTES=4050000000` / 池 153,905 /
+`vllm-venv-030` 都是那次实验的临时状态，**AGENTS.md 与 skill 里的 0.29 / 15.7 万数字并没有过时**。
+差一点就把实验残值写成"文档过时"。
+
+处置：**一个字节都没动那台机器**（没启停、没改配置）—— 别人正在那台机器上作业时，
+只读排查、别动手，判断依据是 `servers` skill 的「先看有没有别人在同一套设施上」。
+自检这边补了两处，正是被这次绊出来的：
+
+* 探测失败时带上连接层错误码（`ECONNREFUSED` / `ETIMEDOUT` / …），
+  `reachability` 那条据此说清是「**主机是通的，但端口上没有进程在监听**（服务没起或正在
+  启动/重启窗口）」还是「连不上主机」—— 而不是笼统一句"一个候选端点都没通"；
+* 一个端点都没通时，`linkage` 那条不再报绿灯（原来会显示「已接入 0 个 / 待接入 0 个 ✓」，
+  那是个**空转的 ✓**：没有任何端点可关联，它什么都没验证）；凭据那条也标注了
+  「与端点是否连得通无关」，免得和两条 ✗ 并排时被读成「其余正常」。
 
 装上之后**刷新一次页面**才会看到新面板（旧页面里还是 v1 那个「同步本地模型」按钮）。

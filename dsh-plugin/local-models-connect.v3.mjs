@@ -90,7 +90,7 @@ export const name = 'local-models-connect'
 export const inject = ['webServer', 'settings']
 
 /** 版本号 —— 自检报告里回显，方便确认页面上跑的是哪一版。 */
-const VERSION = '1.0.0'
+const VERSION = '1.2.0'
 
 /** 写入的设置命名空间（`llm-pi-ai` 的注册者见 dsh-llm-pi-ai）。 */
 const NS = 'llm-pi-ai'
@@ -173,10 +173,33 @@ const DEFAULT_CONFIG = {
   /** 是否允许探测公网端点。默认 false（本插件的用途就是内网本地模型）。 */
   allowPublic: false,
   /** 自动探测的延迟，让 dsh web 先把页面服务起来。 */
-  autoProbeDelayMs: 4000
+  autoProbeDelayMs: 4000,
+  /**
+   * 详细报告自动收起的时间（毫秒）。0 = 不自动收（只留手动点掉）。
+   * 报告是 fixed 定位、不占布局，但一块大字盖在页面上同样烦人 —— 默认 12 秒自己消失。
+   */
+  autoHideMs: 12000
 }
 
 const msg = (error) => (error && error.message) || String(error)
+
+/**
+ * 把 fetch 的失败说清楚。`fetch` 自己只给一句没用的 `fetch failed`，
+ * 真正的原因在 `error.cause.code` 里 —— 而那几个码正好分出完全不同的处境：
+ *   · `ECONNREFUSED` → 主机是通的，**端口上没有进程在听**（服务没起 / 正在启动或重启窗口）
+ *   · `ETIMEDOUT` / `EHOSTUNREACH` / `ENETUNREACH` → 连不到主机或网络
+ *   · `ENOTFOUND` → 名字解析不了
+ * 2026-09-24 就是这么被问住的：自检只说"一个候选端点都没通"，而当时服务其实正在重启（
+ * 09:16:00 health down → 09:16:51 UP），分不出来是"机器没了"还是"刚好在重启"。
+ */
+function describeFetchError(error) {
+  const code = error?.cause?.code ?? error?.code
+  const detail = error?.cause?.message ?? error?.message ?? String(error)
+  return code === undefined ? detail : `${code}：${detail}`
+}
+
+/** 401/500 这类"连上了但回错"的错误带 status，要跟连接层失败分开。 */
+const errorCodeOf = (error) => error?.cause?.code ?? error?.code ?? null
 
 // ─────────────────────────────────────────────────────────────────────────
 // 配置解析（手写校验：宿主插件的第二参数是 patch yml 里的裸对象，没有 schema 兜底）
@@ -238,7 +261,10 @@ export function resolveConfig(raw) {
     streamIdleTimeoutMs: asPositiveInt(source.streamIdleTimeoutMs, DEFAULT_CONFIG.streamIdleTimeoutMs),
     defaultMaxTokens: asPositiveInt(source.defaultMaxTokens, DEFAULT_CONFIG.defaultMaxTokens),
     allowPublic: asBool(source.allowPublic, DEFAULT_CONFIG.allowPublic),
-    autoProbeDelayMs: asPositiveInt(source.autoProbeDelayMs, DEFAULT_CONFIG.autoProbeDelayMs)
+    autoProbeDelayMs: asPositiveInt(source.autoProbeDelayMs, DEFAULT_CONFIG.autoProbeDelayMs),
+    autoHideMs: Number.isFinite(Number(source.autoHideMs)) && Number(source.autoHideMs) >= 0
+      ? Math.floor(Number(source.autoHideMs))
+      : DEFAULT_CONFIG.autoHideMs
   }
 }
 
@@ -586,7 +612,14 @@ export async function probeTarget(target, config) {
   try {
     listing = await getJson(`${target.baseURL}/models`, config.probeTimeoutMs)
   } catch (error) {
-    return { ...base, reachable: false, status: error.status ?? null, latencyMs: Date.now() - started, error: msg(error) }
+    return {
+      ...base,
+      reachable: false,
+      status: error.status ?? null,
+      code: errorCodeOf(error),
+      latencyMs: Date.now() - started,
+      error: error.status === undefined ? describeFetchError(error) : msg(error)
+    }
   }
 
   const latencyMs = Date.now() - started
@@ -881,8 +914,19 @@ async function selfCheck(ctx, config) {
   add('targets', live.length > 0 ? 'ok' : 'fail', `候选端点 ${targets.length} 个，存活 ${live.length} 个`,
     targets.map((t) => `${t.host}:${t.port}`).join('、') || '（没有任何候选）')
   if (live.length === 0) {
+    // 「没通」有三种完全不同的处境，而连接层的错误码正好把它们分开。
+    // 不区分的话，读者只能看到"一个都没通"，然后对着"服务应该还在呀"发呆。
+    const codes = [...new Set(results.map((r) => r.code).filter(Boolean))]
+    const onlyRefused = codes.length > 0 && codes.every((c) => c === 'ECONNREFUSED')
+    const hint = codes.length === 0
+      ? '端点都没回应，原因未识别'
+      : onlyRefused
+        ? '端口拒绝连接（ECONNREFUSED）：**主机是通的，但那些端口上没有进程在监听** —— 服务没起，'
+          + '或正好落在启动/重启窗口里（冷启动 45–60s，systemd 重新拉起还要 +15s）'
+        : `连不到主机或网络（${codes.join('、')}）：查网段、路由与防火墙`
     add('reachability', 'fail', '一个候选端点都没通',
-      `种子主机 ${config.hosts.join('、')}，端口 ${config.ports.join('、')}；确认 GPU 上 modelctl status 且与本机同网段`)
+      `种子主机 ${config.hosts.join('、')}，端口 ${config.ports.join('、')}；${hint}。`
+      + `用 srvctl run gpu "bash ~/deploy-5060ti/modelctl status" 看服务本身`)
   }
 
   const targetRows = []
@@ -967,9 +1011,19 @@ async function selfCheck(ctx, config) {
   }
 
   const unlinked = withModels.filter((r) => existingByOrigin.get(r.origin) === undefined)
-  add('linkage', unlinked.length === 0 ? 'ok' : 'warn',
-    `已接入 provider ${linked.size} 个，待接入端点 ${unlinked.length} 个`,
-    unlinked.length === 0 ? '所有有模型的端点都在模型列表里' : unlinked.map((r) => r.origin).join('、'))
+  if (withModels.length === 0) {
+    // 一个端点都没读到模型时，「已接入 0 个 / 待接入 0 个」是**空转的绿灯** —— 它什么都没验证，
+    // 却和上面两条 ✗ 并排显示，读起来像"其余正常"（2026-09-24 用户就是被这个绊住的）。
+    // 没有可关联的对象时只能报"无法判定"，不能报 ok。
+    add('linkage', 'warn', '接入状态无法判定（没有可关联的端点）',
+      live.length === 0
+        ? '端点一个都没通，先让端点通起来才谈得上接入'
+        : '端点通了但没广告任何模型，先等引擎加载完再看')
+  } else {
+    add('linkage', unlinked.length === 0 ? 'ok' : 'warn',
+      `已接入 provider ${linked.size} 个，待接入端点 ${unlinked.length} 个`,
+      unlinked.length === 0 ? '所有有模型的端点都在模型列表里' : unlinked.map((r) => r.origin).join('、'))
+  }
 
   // ── 凭据可解析性 ──
   // 声明了 `apiKeyEnv` 却取不到值，会让这个 provider **在发请求时**抛 MISSING_CREDENTIAL
@@ -991,7 +1045,10 @@ async function selfCheck(ctx, config) {
       `或删掉该 provider 的 apiKeyEnv（本地端点通常不需要鉴权）`)
   }
   if (declaredCredentials > 0 && credentialsOk) {
-    add('credentials', 'ok', `${declaredCredentials} 个本地 provider 的凭据都能取到值`, '解析口径与 dsh-llm-pi-ai 的 resolveApiKey 一致')
+    // 标题里明说「与端点连通性无关」：这条绿灯只证明凭据能解析，不证明模型能用。
+    // 2026-09-24 它和两条 ✗ 并排出现时，被读成了「其余正常」。
+    add('credentials', 'ok', `${declaredCredentials} 个本地 provider 的凭据都能取到值（与端点是否连得通无关）`,
+      '解析口径与 dsh-llm-pi-ai 的 resolveApiKey 一致；只看凭据存不存在，不代表模型此刻可用')
   }
 
   const verdict = checks.some((c) => c.level === 'fail') ? 'fail' : (checks.some((c) => c.level === 'warn') ? 'warn' : 'ok')
@@ -1044,51 +1101,98 @@ function singleFlight(job) {
  * 样式走独立的 `style` 行、脚本走 `script` 行 —— 不再把 CSS 塞进模板字符串里，
  * 省掉 v1 那种 `\`` 转义（改一个颜色都要数反斜杠）。
  */
+/**
+ * 面板：两个按钮挂进**会话头部的 utilities 行**、「在本地打开」那个分体控件的**左边**。
+ *
+ * 样式不自己发明 —— 直接抄 `dsh-client-ui-open-in-app` 的度量（28px 高 / 14px 圆角 /
+ * .5px `border-l4` / 11px·16px 字 / 同 padding），并复用同一批 `--dsw-alias-*` 设计令牌，
+ * 所以深浅色主题、hover、disabled 都跟着 DSH 自己的外观走，不用维护第二套配色。
+ *
+ * 报告区不再常驻占地方：它是 `position: fixed`（不参与布局、不推挤页面），并且
+ * 点报告本身 / 再点按钮 / 按 Esc / 滚页面 / 超时（`autoHideMs`，默认 12s）都会收起。
+ * 旧版把报告留在文档流里，点一次就永久占一块地方 —— 2026-09-24 用户点名要改的就是这个。
+ *
+ * 拿不到头部（还没进会话）时退回右下角浮动，按钮不会凭空消失。
+ */
 const PANEL_STYLE = `
-#lmc-panel { position: fixed; right: 18px; bottom: 18px; z-index: 2147483000;
-  display: flex; flex-direction: column; align-items: flex-end; gap: 6px;
-  font: 12px/1.45 -apple-system, "SF Pro Text", "Segoe UI", "Helvetica Neue", sans-serif; }
-#lmc-panel .lmc-row { display: flex; gap: 6px; align-items: center; }
-#lmc-panel button { cursor: pointer; border: 1px solid rgba(127,127,127,.45); border-radius: 999px;
-  padding: 7px 14px; background: rgba(28,28,30,.86); color: #f2f2f7; opacity: .55;
-  transition: opacity .15s ease, transform .1s ease; backdrop-filter: blur(6px); }
-#lmc-panel:hover button { opacity: 1; }
-#lmc-panel button:active { transform: scale(.97); }
-#lmc-panel button[disabled] { cursor: progress; opacity: 1; }
-#lmc-panel .lmc-dot { width: 9px; height: 9px; border-radius: 50%; background: #8e8e93;
-  box-shadow: 0 0 0 3px rgba(28,28,30,.55); }
-#lmc-panel .lmc-dot.ok { background: #30d158; }
-#lmc-panel .lmc-dot.warn { background: #ffd60a; }
-#lmc-panel .lmc-dot.fail { background: #ff453a; }
-#lmc-panel .lmc-box { max-width: min(62vw, 620px); max-height: 46vh; overflow: auto; text-align: left;
-  padding: 9px 11px; border-radius: 10px; background: rgba(28,28,30,.94); color: #f2f2f7;
-  white-space: pre-wrap; word-break: break-word; display: none;
-  font-family: ui-monospace, Menlo, Consolas, monospace; }
-#lmc-panel .lmc-box.show { display: block; }
+#lmc-tools { display: inline-flex; align-items: center; gap: 6px; }
+#lmc-tools.lmc-float { position: fixed; right: 18px; bottom: 18px; z-index: 2147483000; }
+#lmc-tools .lmc-btn { box-sizing: border-box; height: 28px; border-radius: 14px;
+  border: .5px solid var(--dsw-alias-border-l4); background: transparent;
+  font-family: var(--dsw-font-family); font-size: 11px; font-weight: 400; line-height: 16px;
+  color: var(--dsw-alias-label-primary); padding: 5px 10px;
+  display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; cursor: pointer; }
+#lmc-tools .lmc-btn:hover:not(:disabled) { background: var(--dsw-alias-interactive-bg-hover); }
+#lmc-tools .lmc-btn:disabled { color: var(--dsw-alias-label-dimmed); cursor: progress; }
+#lmc-tools .lmc-btn:focus-visible { outline: none; box-shadow: inset 0 0 0 1px var(--dsw-alias-label-secondary); }
+#lmc-tools .lmc-dot { flex: none; width: 6px; height: 6px; border-radius: 50%;
+  background: var(--dsw-alias-label-dimmed); }
+#lmc-tools .lmc-dot.ok { background: var(--dsw-alias-state-success-primary); }
+#lmc-tools .lmc-dot.warn { background: var(--dsw-alias-state-warn-primary); }
+#lmc-tools .lmc-dot.fail { background: var(--dsw-alias-state-error-primary); }
+#lmc-box { position: fixed; z-index: 2147483000; display: none; text-align: left;
+  box-sizing: border-box; width: min(72vw, 560px); max-height: 42vh; overflow: auto; cursor: pointer;
+  padding: 9px 11px; border-radius: 10px; border: .5px solid var(--dsw-alias-border-l4);
+  background: var(--dsw-alias-bg-layer-3); color: var(--dsw-alias-label-primary);
+  box-shadow: 0 8px 28px rgba(0, 0, 0, .3);
+  font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 11px; line-height: 1.5;
+  white-space: pre-wrap; word-break: break-word; }
+#lmc-box.show { display: block; }
 `
 
-const PANEL_SCRIPT = `(() => {
-  const ID = 'lmc-panel';
+/**
+ * 页面脚本。`autoHideMs` 是唯一的注入参数 —— 用一个函数包着，而不是把配置塞进模块级常量：
+ * 常量在模块加载时就定死了，config 改了脚本不会跟着变。
+ */
+function panelScript(autoHideMs) {
+  return `(() => {
+  const ID = 'lmc-tools';
+  const BOX_ID = 'lmc-box';
   const API = {
     state: ${JSON.stringify(ROUTE_STATE)},
     run: ${JSON.stringify(ROUTE_RUN)},
     selfcheck: ${JSON.stringify(ROUTE_SELFCHECK)}
   };
+  const AUTO_HIDE_MS = ${Number(autoHideMs)};
+
   if (window.__localModelsConnectInstalled) return;
   window.__localModelsConnectInstalled = true;
 
-  let dot, box, runButton, checkButton;
+  let tools = null, box = null, dot = null;
+  let checkButton = null, checkLabel = null, runButton = null, runLabel = null;
+  let hideTimer = null, observerTimer = null, pendingVerdict = null;
 
-  function say(text) {
-    if (!box) return;
-    box.textContent = text;
-    box.classList.add('show');
+  // ── 报告区：fixed 定位，绝不占布局 ──
+  function hideBox() {
+    clearTimeout(hideTimer);
+    hideTimer = null;
+    if (box !== null) box.classList.remove('show');
   }
 
-  function setStatus(level, title) {
-    if (!dot) return;
-    dot.className = 'lmc-dot' + (level ? ' ' + level : '');
-    dot.title = title || '';
+  function placeBox() {
+    if (tools === null || box === null || !box.classList.contains('show')) return;
+    // 宽度是 CSS 里写死的（width: min(72vw, 560px)），所以 offsetWidth 不受上一次 left 影响。
+    // 这里刻意不用 max-width + shrink-to-fit：那样「可用宽度」会被上一次的 left 截断，
+    // 量出来的是「剩下的空间」，每次重排都把弹窗又往左推一截（实测右边缘差 59px）。
+    const width = box.offsetWidth;
+    const rect = tools.getBoundingClientRect();
+    const left = Math.max(8, Math.min(Math.round(rect.right - width), window.innerWidth - width - 8));
+    box.style.left = left + 'px';
+    box.style.top = Math.round(rect.bottom + 8) + 'px';
+  }
+
+  function showBox(text) {
+    if (box === null) return;
+    box.textContent = text;
+    box.classList.add('show');
+    placeBox();
+    clearTimeout(hideTimer);
+    hideTimer = AUTO_HIDE_MS > 0 ? setTimeout(hideBox, AUTO_HIDE_MS) : null;
+  }
+
+  function setDot(level) {
+    pendingVerdict = level || null;
+    if (dot !== null) dot.className = 'lmc-dot' + (pendingVerdict ? ' ' + pendingVerdict : '');
   }
 
   async function post(url) {
@@ -1124,6 +1228,7 @@ const PANEL_SCRIPT = `(() => {
     }
     if (dropped.length > 0) lines.push('未采纳：' + dropped.join('；'));
     lines.push(report.wrote ? '已写入设置（settings 热重载）' : '未写入设置');
+    lines.push('（点这里、再点按钮、按 Esc 或等一会儿都会收起）');
     return lines.join('\\n');
   }
 
@@ -1140,94 +1245,147 @@ const PANEL_SCRIPT = `(() => {
       lines.push((icon[c.level] || '·') + ' ' + c.title);
       if (c.detail && c.level !== 'ok') lines.push('    ' + c.detail);
     }
+    lines.push('');
+    lines.push('（点这里、再点按钮、按 Esc 或等一会儿都会收起）');
     return lines.join('\\n');
   }
 
-  function build() {
-    if (document.getElementById(ID) || !document.body) return;
-    const host = document.createElement('div');
-    host.id = ID;
-
-    box = document.createElement('div');
-    box.className = 'lmc-box';
-
-    const row = document.createElement('div');
-    row.className = 'lmc-row';
-    dot = document.createElement('span');
-    dot.className = 'lmc-dot';
-    dot.title = '本地模型接入自检状态';
-
-    checkButton = document.createElement('button');
-    checkButton.type = 'button';
-    checkButton.textContent = '自检';
-    checkButton.title = '只读检查：端点通不通、认出什么模型、声明与引擎对不对得上';
-    checkButton.addEventListener('click', function () {
-      invoke(checkButton, '自检中…', async function () {
-        const report = await post(API.selfcheck);
-        setStatus(report && report.verdict, '最近一次自检：' + (report && report.verdict));
-        say(renderCheck(report));
-      });
-    });
-
-    runButton = document.createElement('button');
-    runButton.type = 'button';
-    runButton.textContent = '接入本地模型';
-    runButton.title = '扫描种子主机端口，把发现到的本地模型自动接进模型列表';
-    runButton.addEventListener('click', function () {
-      invoke(runButton, '接入中…', async function () {
-        const report = await post(API.run);
-        say(renderRun(report));
-        const check = await post(API.selfcheck);
-        setStatus(check && check.verdict, '自检：' + (check && check.verdict));
-      });
-    });
-
-    row.appendChild(dot);
-    row.appendChild(checkButton);
-    row.appendChild(runButton);
-    host.appendChild(box);
-    host.appendChild(row);
-    document.body.appendChild(host);
-
-    // 页面加载时只读缓存（不打网络）：插件开机自检跑过的话，状态点是热的。
-    fetch(API.state, { headers: { accept: 'application/json' } })
-      .then(function (r) { return r.json(); })
-      .then(function (state) {
-        if (state && state.lastSelfCheck) {
-          setStatus(state.lastSelfCheck.verdict,
-            '最近一次自检：' + state.lastSelfCheck.verdict + ' @ ' + state.lastSelfCheck.at);
-        }
-      })
-      .catch(function () {});
+  // ── 头部锚点：找「在本地打开」那个分体控件的容器 ──
+  // 它的 CSS module 类名是 <hash>_split —— 哈希会随构建变，所以用**行为特征**定位：
+  // 一个 class 含 "_split" 的 div，里面带 aria-haspopup=menu 的箭头按钮。
+  function findAnchor() {
+    const splits = document.querySelectorAll('div[class*="_split"]');
+    for (let i = 0; i < splits.length; i++) {
+      if (splits[i].querySelector('button[aria-haspopup="menu"]') !== null) return splits[i];
+    }
+    return null;
   }
 
-  async function invoke(button, working, job) {
-    const original = button.textContent;
+  function makeButton(label, hint, withDot) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'lmc-btn';
+    button.title = hint;
+    const text = document.createElement('span');
+    text.textContent = label;
+    if (withDot) {
+      dot = document.createElement('span');
+      dot.className = 'lmc-dot' + (pendingVerdict ? ' ' + pendingVerdict : '');
+      button.appendChild(dot);
+    }
+    button.appendChild(text);
+    return { button: button, label: text };
+  }
+
+  async function invoke(button, labelEl, working, normal, job) {
     button.disabled = true;
-    button.textContent = working;
+    labelEl.textContent = working;
     try {
       await job();
     } catch (error) {
-      say('请求失败：' + (error && error.message ? error.message : String(error)));
-      setStatus('fail', '请求失败');
+      showBox('请求失败：' + (error && error.message ? error.message : String(error)));
+      setDot('fail');
     } finally {
       button.disabled = false;
-      button.textContent = original;
+      labelEl.textContent = normal;
     }
   }
 
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', build, { once: true });
-  } else {
-    build();
-  }
-  new MutationObserver(function () { if (document.body && !document.getElementById(ID)) build(); })
-    .observe(document.documentElement, { childList: true, subtree: true });
-})();`
+  function build() {
+    if (document.body === null) return;
+    if (document.getElementById(ID) !== null) return;
 
-function injectPanel(table) {
+    tools = document.createElement('div');
+    tools.id = ID;
+
+    box = document.createElement('div');
+    box.id = BOX_ID;
+    box.title = '点一下收起';
+    box.addEventListener('click', hideBox);
+    tools.appendChild(box);
+
+    const check = makeButton('自检', '只读检查：端点通不通、认出什么模型、声明与引擎对不对得上', true);
+    checkButton = check.button;
+    checkLabel = check.label;
+    checkButton.addEventListener('click', function () {
+      invoke(checkButton, checkLabel, '自检中…', '自检', async function () {
+        const report = await post(API.selfcheck);
+        setDot(report && report.verdict);
+        showBox(renderCheck(report));
+      });
+    });
+
+    const run = makeButton('接入本地模型', '扫描种子主机端口，把发现到的本地模型自动接进模型列表', false);
+    runButton = run.button;
+    runLabel = run.label;
+    runButton.addEventListener('click', function () {
+      invoke(runButton, runLabel, '接入中…', '接入本地模型', async function () {
+        const report = await post(API.run);
+        showBox(renderRun(report));
+        const check = await post(API.selfcheck);
+        setDot(check && check.verdict);
+      });
+    });
+
+    tools.appendChild(checkButton);
+    tools.appendChild(runButton);
+  }
+
+  /** 每次都把按钮摆回「在本地打开」左边；拿不到头部就退回右下角。 */
+  function ensure() {
+    if (document.body === null) return;
+    if (tools === null || !tools.isConnected) {
+      dot = null;
+      tools = null;
+      build();
+    }
+    if (tools === null) return;
+
+    const anchor = findAnchor();
+    if (anchor !== null && anchor.parentElement !== null) {
+      if (tools.parentElement !== anchor.parentElement || tools.nextElementSibling !== anchor) {
+        hideBox();
+        tools.classList.remove('lmc-float');
+        anchor.parentElement.insertBefore(tools, anchor);
+      }
+    } else if (tools.parentElement !== document.body) {
+      hideBox();
+      tools.classList.add('lmc-float');
+      document.body.appendChild(tools);
+    }
+  }
+
+  function schedule() {
+    if (observerTimer !== null) return;
+    observerTimer = setTimeout(function () { observerTimer = null; ensure(); }, 300);
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', ensure, { once: true });
+  } else {
+    ensure();
+  }
+  new MutationObserver(schedule).observe(document.documentElement, { childList: true, subtree: true });
+  document.addEventListener('keydown', function (event) { if (event.key === 'Escape') hideBox(); });
+  window.addEventListener('resize', placeBox);
+  document.addEventListener('scroll', function (event) {
+    if (box !== null && (event.target === box || box.contains(event.target))) placeBox();
+    else hideBox();
+  }, true);
+
+  // 页面加载时只读缓存（不打网络）：状态点是热的。
+  fetch(API.state, { headers: { accept: 'application/json' } })
+    .then(function (response) { return response.json(); })
+    .then(function (state) {
+      if (state && state.lastSelfCheck) setDot(state.lastSelfCheck.verdict);
+    })
+    .catch(function () {});
+})();`
+}
+
+function injectPanel(table, config) {
   table.push({ kind: 'style', text: PANEL_STYLE })
-  table.push({ kind: 'script', placement: 'head', text: PANEL_SCRIPT })
+  table.push({ kind: 'script', placement: 'head', text: panelScript(config.autoHideMs) })
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1278,6 +1436,7 @@ export function apply(ctx, pluginConfig) {
         autoApply: config.autoApply,
         prune: config.prune,
         adoptUnknownContext: config.adoptUnknownContext,
+        autoHideMs: config.autoHideMs,
         probeTimeoutMs: config.probeTimeoutMs
       },
       lastRun: cache.run,
@@ -1310,7 +1469,7 @@ export function apply(ctx, pluginConfig) {
     handler: guard(async () => await singleFlight(() => selfCheck(ctx, config)))
   }), 'local-models-connect: selfcheck route')
 
-  ctx.on('webserver/index-inject', injectPanel)
+  ctx.on('webserver/index-inject', (table) => injectPanel(table, config))
 
   // 开机自动接入 —— 「新环境装上插件即可用」这一步就在这里。
   if (config.autoProbe) {

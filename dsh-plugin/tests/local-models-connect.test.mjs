@@ -6,13 +6,13 @@
  *   4. 实机冒烟：真打 192.168.0.119:8080（不在线只记 warn，不算失败）。
  *
  * 跑法：node dsh-plugin/tests/local-models-connect.test.mjs [插件路径]
- *       （不给路径就测同仓库的 ../local-models-connect.v1.mjs）
+ *       （不给路径就测同仓库的 ../local-models-connect.v3.mjs）
  */
 import assert from 'node:assert/strict'
 import http from 'node:http'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
-const MODULE_PATH = process.argv[2] ?? fileURLToPath(new URL('../local-models-connect.v1.mjs', import.meta.url))
+const MODULE_PATH = process.argv[2] ?? fileURLToPath(new URL('../local-models-connect.v3.mjs', import.meta.url))
 const plugin = await import(pathToFileURL(MODULE_PATH).href)
 
 let pass = 0
@@ -522,6 +522,16 @@ await ta('probeTarget：端口不通 → reachable:false 且带 error，不抛',
   assert.ok(typeof result.error === 'string' && result.error.length > 0)
 })
 
+await ta('probeTarget：端口不通时给出连接层错误码，而不是一句没用的 fetch failed', async () => {
+  const port = await deadPort()
+  const result = await plugin.probeTarget(
+    { baseURL: `http://127.0.0.1:${port}/v1`, origin: `http://127.0.0.1:${port}`, host: '127.0.0.1', port }, baseConfig())
+  assert.equal(result.reachable, false)
+  assert.equal(result.code, 'ECONNREFUSED', '要能区分「主机通、端口没监听」与「连不上主机」')
+  assert.match(result.error, /ECONNREFUSED/)
+  assert.notEqual(result.error, 'fetch failed')
+})
+
 await ta('probeTarget：列表结构不对 → reachable 但带读不动的 error', async () => {
   const engine = await fakeEngine((req, res) => {
     if (req.url === '/v1/models') return json(res, 200, { object: 'list' })
@@ -588,6 +598,45 @@ await ta('端到端：新环境（没有任何 provider）→ run 建出 provide
     assert.equal(again.body.providers[0].action, 'unchanged')
     assert.equal(host.mutations.length, 1)
   } finally { await web.close(); await vllm.close() }
+})
+
+await ta('面板：按钮挂到「在本地打开」左边、度量与原生同档、弹窗会自己收起', async () => {
+  const host = makeHost()
+  plugin.apply(host.ctx, { autoProbe: false, autoHideMs: 4321 })
+  const table = []
+  for (const inject of host.injects) if (inject.event === 'webserver/index-inject') inject.fn(table)
+  const style = table.find((r) => r.kind === 'style').text
+  const script = table.find((r) => r.kind === 'script').text
+
+  // ① 位置：定位「在本地打开」那个分体控件的容器（<hash>_split + aria-haspopup=menu），插在它**前面**
+  assert.match(script, /div\[class\*="_split"\]/, '要按分体控件的容器类名找锚点')
+  assert.match(script, /button\[aria-haspopup="menu"\]/, '要用行为特征确认是那个分体控件，而不是只信哈希类名')
+  assert.match(script, /insertBefore\(tools, anchor\)/, '必须是插到锚点前面 = 按钮在它左边')
+  assert.ok(!/position: fixed; right: 18px; bottom: 18px/.test(style) || style.includes('lmc-float'),
+    '常驻右下角的浮动面板只能作为拿不到头部时的退路')
+
+  // ② 样式：照抄 dsh-client-ui-open-in-app 的度量 + 复用 DSH 设计令牌（深浅色主题自动跟）
+  for (const token of ['--dsw-alias-border-l4', '--dsw-font-family', '--dsw-alias-label-primary',
+    '--dsw-alias-interactive-bg-hover', '--dsw-alias-bg-layer-3', '--dsw-alias-state-warn-primary']) {
+    assert.ok(style.includes(token), `样式里应复用设计令牌 ${token}`)
+  }
+  assert.match(style, /height: 28px/, '原生分体控件就是 28px 高')
+  assert.match(style, /border-radius: 14px/)
+  assert.match(style, /font-size: 11px/)
+
+  // ③ 两个按钮走同一个工厂 = 同一套大小风格；只有「自检」多一个状态点
+  assert.match(script, /makeButton\('自检'/)
+  assert.match(script, /makeButton\('接入本地模型'/)
+  assert.equal((script.match(/className = 'lmc-btn'/g) || []).length, 1, '两个按钮共用一个类名')
+  assert.match(script, /tools\.appendChild\(checkButton\)/)
+  assert.match(script, /tools\.appendChild\(runButton\)/)
+
+  // ④ 弹窗不常驻：不占布局 + 自动收起 + 点它收起 + Esc 收起
+  assert.match(style, /#lmc-box \{ position: fixed/, '弹窗必须 fixed，否则会顶开页面')
+  assert.match(script, /const AUTO_HIDE_MS = 4321;/, 'autoHideMs 要真的流进注入脚本')
+  assert.match(script, /setTimeout\(hideBox, AUTO_HIDE_MS\)/)
+  assert.match(script, /box\.addEventListener\('click', hideBox\)/)
+  assert.match(script, /event\.key === 'Escape'/)
 })
 
 await ta('端到端：dry=1 只看不写', async () => {
@@ -715,6 +764,42 @@ await ta('端到端：手写的 maxTokens 大过压缩余量 → 自检 fail 并
     assert.ok(headroom, '必须报出 headroom 这一条')
     assert.match(headroom.detail, /把 maxTokens 降到 30000/)
   } finally { await web.close(); await vllm.close() }
+})
+
+await ta('端到端：一个端点都没通时，接入状态不能报绿灯（2026-09-24 的空转 ✓）', async () => {
+  const port = await deadPort()
+  // 复刻用户实际那一屏：一个内网 provider 在册、它的端点却一个都没通
+  const host = makeHost({
+    'llm-pi-ai': {
+      providers: {
+        'qwen-local': {
+          api: 'openai-completions', baseURL: 'http://192.168.0.119:8080/v1', apiKeyEnv: 'LMC_PRESENT',
+          models: [{ id: 'Qwen3.8-27B-Q6-dual-5060ti', contextWindow: 150000, maxTokens: 16384 }]
+        }
+      }
+    }
+  }, { credentials: { resolve: async (ref) => (ref === 'LMC_PRESENT' ? { value: 'x' } : undefined) } })
+  plugin.apply(host.ctx, { autoProbe: false, hosts: ['127.0.0.1'], ports: [port], includeConfigured: false, probeTimeoutMs: 500 })
+  const web = await serveRoutes(host.routes)
+  try {
+    const check = await web.get(plugin.ROUTE_SELFCHECK)
+    assert.equal(check.body.verdict, 'fail')
+    assert.equal(check.body.summary.reachable, 0)
+
+    const linkage = check.body.checks.find((c) => c.id === 'linkage')
+    assert.notEqual(linkage.level, 'ok', '没有可关联的端点时不能给绿灯 —— 这条 ✓ 什么都没验证')
+    assert.equal(linkage.level, 'warn')
+    assert.match(linkage.title, /无法判定/)
+
+    const reach = check.body.checks.find((c) => c.id === 'reachability')
+    assert.match(reach.detail, /ECONNREFUSED/)
+    assert.match(reach.detail, /主机是通的/, '要说清是「主机通、端口没听」还是「连不上主机」')
+
+    // 凭据那条仍然是绿的，但标题必须说清它与连通性无关
+    const cred = check.body.checks.find((c) => c.id === 'credentials')
+    assert.equal(cred.level, 'ok')
+    assert.match(cred.title, /与端点是否连得通无关/)
+  } finally { await web.close() }
 })
 
 await ta('端到端：全部端口不通 → 自检 fail 且指明「一个都没通」', async () => {
