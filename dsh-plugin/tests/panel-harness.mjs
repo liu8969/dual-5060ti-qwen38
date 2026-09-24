@@ -20,7 +20,7 @@ import http from 'node:http'
 import { writeFileSync } from 'node:fs'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
-const MODULE = process.argv[2] ?? fileURLToPath(new URL('../local-models-connect.v5.mjs', import.meta.url))
+const MODULE = process.argv[2] ?? fileURLToPath(new URL('../local-models-connect.v6.mjs', import.meta.url))
 const AUTO_HIDE_MS = Number(process.argv[3] ?? 9000)
 const PORT = Number(process.argv[4] ?? 18181)
 const plugin = await import(pathToFileURL(MODULE).href)

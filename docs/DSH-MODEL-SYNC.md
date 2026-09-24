@@ -39,11 +39,11 @@ models:
 
 ## 3. 新一代：`local-models-connect.v1`
 
-源码：[`../dsh-plugin/local-models-connect.v5.mjs`](../dsh-plugin/local-models-connect.v5.mjs)
+源码：[`../dsh-plugin/local-models-connect.v6.mjs`](../dsh-plugin/local-models-connect.v6.mjs)
 测试：[`../dsh-plugin/tests/local-models-connect.test.mjs`](../dsh-plugin/tests/local-models-connect.test.mjs)（65 条，`node dsh-plugin/tests/local-models-connect.test.mjs`）
 面板验证台：[`../dsh-plugin/tests/panel-harness.mjs`](../dsh-plugin/tests/panel-harness.mjs)（起一个仿真的会话头部 + 桩路由，供真浏览器驱动；真 GUI 要 token，而凭据不进 agent 命令）
 
-装到 `~/.dsh/plugins/local-models-connect.v5.mjs`，并在
+装到 `~/.dsh/plugins/local-models-connect.v6.mjs`，并在
 `~/.dsh/profiles/web/cordis.patch.yml` 里挂一条（见 §6）。**它取代了 `local-models-sync.v1`**。
 
 它做三件事：
@@ -146,9 +146,13 @@ curl -sS http://127.0.0.1:3080/local-models-connect/selfcheck | python3 -m json.
 * 度量照抄 `dsh-client-ui-open-in-app` 的 28px 高 / 14px 圆角 / `.5px` `border-l4` /
   11px·16px 字 / 同 padding，并复用同一批 `--dsw-alias-*` 令牌 —— 深浅色主题、hover、
   disabled 都跟着 DSH 走。
-* 报告弹窗是 `position: fixed`（**不参与布局、不顶开页面**），并且点它自己 / 再点按钮 /
-  按 Esc / 滚页面 / 超时（`autoHideMs`，默认 12 秒）都会收起。旧版把报告留在文档流里，
-  点一次就永久占一块地方 —— 2026-09-24 用户点名要改的就是这个。
+* 报告弹窗是 `position: fixed`（**不参与布局、不顶开页面**）。收起方式：**右上角的叉**、
+  再点按钮、按 Esc、滚页面、超时（`autoHideMs`，默认 12 秒）。
+  **整块弹窗不可点**（`cursor` 是 `auto`，不是 `pointer`）—— 早先它自己就是关闭热区，
+  于是报告末尾还得附一行「点这里…」的说明，看着像个大按钮（2026-09-24 用户要求换掉）。
+  叉是 22×22 的绝对定位按钮（`top/right: 4px`），挂在 `#lmc-box` 上；
+  可滚动的正文是**另一个元素** `#lmc-body`，否则叉会跟着正文一起滚走。
+  旧版把报告留在文档流里，点一次就永久占一块地方 —— 也是 2026-09-24 点名要改的。
 
 样式走独立的 `style` 注入行、脚本走 `script` 行（v1 把 CSS 塞在模板字符串里，改一个颜色
 都要数反斜杠）。页面加载时只读 `/state` 的缓存，不打网络。
@@ -211,7 +215,7 @@ v1 只强制引擎**广告出来的事实**（`contextWindow` / `maxTokens` 上�
 ```yaml
 - insert:
     - id: local-models-connect
-      name: "/home/lcy/.dsh/plugins/local-models-connect.v5.mjs"
+      name: "/home/lcy/.dsh/plugins/local-models-connect.v6.mjs"
       config:
         hosts: ['192.168.0.119']          # 种子主机：唯一的扫描范围，要加机器改这一行
         ports: [8080, 8000, 30000, 8081, 11434, 1234]
@@ -267,7 +271,7 @@ curl -sS http://127.0.0.1:3080/local-models-connect/state | python3 -m json.tool
 ```bash
 cp ~/.dsh/profiles/web/cordis.patch.yml.bak-before-local-models-connect-<ts> \
    ~/.dsh/profiles/web/cordis.patch.yml
-rm ~/.dsh/plugins/local-models-connect.v5.mjs
+rm ~/.dsh/plugins/local-models-connect.v6.mjs
 ```
 
 `settings.yaml` 的写入是幂等的（值没变就不写），回滚插件不会把设置改回去。
@@ -349,9 +353,12 @@ v5（单按钮版）：
   `—— 自检 WARN：4 通过 · 2 提醒 · 0 失败` 汇总行在下，**ok 的条目被滤掉**、warn 的明细保留；
   状态点转 `warn`；
 * 弹窗 `position: fixed`：展示前后头部高度都是 45、文档高度不变 —— **不顶开页面**；
-  右边缘与按钮组右边缘**逐像素对齐**；
-* 收起四条路都验过：点弹窗、按 Esc、超时（`autoHideMs`）、滚动页面；把 `#lmc-tools` 从 DOM
-  里删掉 → MutationObserver 300ms 后重挂，且**不重复**（1 个实例）；
+  右边缘与按钮组右边缘**逐像素对齐**；叉 22×22、距外框右上角各 5px，
+  正文内容右缘离叉左边 5px（**文字不会钻到叉底下**）；
+* 收起：**点正文不再关闭**（`stillOpenAfterBodyClick: true`）、点叉关闭、按 Esc 关闭；
+  超时关闭是**精确**的 —— 页面内埋 MutationObserver 记录 class 变化，`shown→hidden`
+  的时间差是 **2500ms**（当时 `autoHideMs=2500`），不是"大概"；
+* 把 `#lmc-tools` 从 DOM 里删掉 → MutationObserver 300ms 后重挂，且**不重复**（1 个实例）；
 * 0 条 console 错误。
 
 **红绿对照（这次的 0px bug）**：把 HEAD 里那一版 v4 交给同一个验证台跑 ——

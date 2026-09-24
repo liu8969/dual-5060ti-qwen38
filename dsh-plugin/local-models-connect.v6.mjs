@@ -90,7 +90,7 @@ export const name = 'local-models-connect'
 export const inject = ['webServer', 'settings']
 
 /** 版本号 —— 自检报告里回显，方便确认页面上跑的是哪一版。 */
-const VERSION = '1.4.0'
+const VERSION = '1.5.0'
 
 /** 写入的设置命名空间（`llm-pi-ai` 的注册者见 dsh-llm-pi-ai）。 */
 const NS = 'llm-pi-ai'
@@ -1136,14 +1136,25 @@ const PANEL_STYLE = `
 #lmc-tools .lmc-dot.ok { background: var(--dsw-alias-state-success-primary); }
 #lmc-tools .lmc-dot.warn { background: var(--dsw-alias-state-warn-primary); }
 #lmc-tools .lmc-dot.fail { background: var(--dsw-alias-state-error-primary); }
+/* 弹窗 = 外框（fixed，定宽）+ 右上角的叉 + 可滚动的正文。
+   不要把 overflow:auto 放在外框上：那样叉会跟着正文一起滚走。
+   也不要给外框 cursor:pointer —— 它不是一个"点一下"的按钮（2026-09-24 用户的原话：
+   「不想是可以点的按钮，换成叉叉在右上角」）。 */
 #lmc-box { position: fixed; z-index: 2147483000; display: none; text-align: left;
-  box-sizing: border-box; width: min(72vw, 560px); max-height: 42vh; overflow: auto; cursor: pointer;
+  box-sizing: border-box; width: min(72vw, 560px); max-height: 42vh; overflow: hidden;
   padding: 9px 11px; border-radius: 10px; border: .5px solid var(--dsw-alias-border-l4);
   background: var(--dsw-alias-bg-layer-3); color: var(--dsw-alias-label-primary);
-  box-shadow: 0 8px 28px rgba(0, 0, 0, .3);
+  box-shadow: 0 8px 28px rgba(0, 0, 0, .3); }
+#lmc-box.show { display: block; }
+#lmc-box .lmc-close { position: absolute; top: 4px; right: 4px; width: 22px; height: 22px;
+  display: inline-flex; align-items: center; justify-content: center; padding: 0;
+  border: 0; border-radius: 6px; background: transparent; cursor: pointer;
+  color: var(--dsw-alias-label-secondary); font-size: 14px; line-height: 1; }
+#lmc-box .lmc-close:hover { background: var(--dsw-alias-interactive-bg-hover);
+  color: var(--dsw-alias-label-primary); }
+#lmc-body { max-height: calc(42vh - 18px); overflow: auto; padding-right: 20px;
   font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 11px; line-height: 1.5;
   white-space: pre-wrap; word-break: break-word; }
-#lmc-box.show { display: block; }
 `
 
 /**
@@ -1154,6 +1165,7 @@ function panelScript(autoHideMs) {
   return `(() => {
   const ID = 'lmc-tools';
   const BOX_ID = 'lmc-box';
+  const BODY_ID = 'lmc-body';
   const API = {
     state: ${JSON.stringify(ROUTE_STATE)},
     run: ${JSON.stringify(ROUTE_RUN)},
@@ -1164,7 +1176,7 @@ function panelScript(autoHideMs) {
   if (window.__localModelsConnectInstalled) return;
   window.__localModelsConnectInstalled = true;
 
-  let tools = null, box = null, dot = null;
+  let tools = null, box = null, body = null, dot = null;
   let runButton = null, runLabel = null;
   let hideTimer = null, observerTimer = null, pendingVerdict = null;
 
@@ -1188,8 +1200,8 @@ function panelScript(autoHideMs) {
   }
 
   function showBox(text) {
-    if (box === null) return;
-    box.textContent = text;
+    if (box === null || body === null) return;
+    body.textContent = text;
     box.classList.add('show');
     placeBox();
     clearTimeout(hideTimer);
@@ -1255,10 +1267,8 @@ function panelScript(autoHideMs) {
   }
 
   function renderReport(run, check) {
-    return renderRunLines(run)
-      .concat(renderCheckLines(check))
-      .concat(['（点这里、再点按钮、按 Esc 或等一会儿都会收起）'])
-      .join('\\n');
+    // 不再附「按哪里会收起」那行提示 —— 收起方式由右上角的叉自己说明（用户 2026-09-24 要求）。
+    return renderRunLines(run).concat(renderCheckLines(check)).join('\\n');
   }
 
   // ── 头部锚点：找「在本地打开」那条 slot 条目，插到它**最外层**前面 ──
@@ -1338,8 +1348,21 @@ function panelScript(autoHideMs) {
 
     box = document.createElement('div');
     box.id = BOX_ID;
-    box.title = '点一下收起';
-    box.addEventListener('click', hideBox);
+
+    // 右上角的叉：唯一的"点"目标。整块弹窗不再可点（用户明确不要那种"它像个按钮"的感觉）。
+    const close = document.createElement('button');
+    close.type = 'button';
+    close.className = 'lmc-close';
+    close.textContent = '×';
+    close.title = '收起';
+    close.setAttribute('aria-label', '收起');
+    close.addEventListener('click', hideBox);
+    box.appendChild(close);
+
+    body = document.createElement('div');
+    body.id = BODY_ID;
+    box.appendChild(body);
+
     tools.appendChild(box);
 
     const main = makeButton('接入本地模型', '发现本地端点并接进模型列表，随后做一次只读自检', true);

@@ -6,13 +6,13 @@
  *   4. 实机冒烟：真打 192.168.0.119:8080（不在线只记 warn，不算失败）。
  *
  * 跑法：node dsh-plugin/tests/local-models-connect.test.mjs [插件路径]
- *       （不给路径就测同仓库的 ../local-models-connect.v5.mjs）
+ *       （不给路径就测同仓库的 ../local-models-connect.v6.mjs）
  */
 import assert from 'node:assert/strict'
 import http from 'node:http'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
-const MODULE_PATH = process.argv[2] ?? fileURLToPath(new URL('../local-models-connect.v5.mjs', import.meta.url))
+const MODULE_PATH = process.argv[2] ?? fileURLToPath(new URL('../local-models-connect.v6.mjs', import.meta.url))
 const plugin = await import(pathToFileURL(MODULE_PATH).href)
 
 let pass = 0
@@ -650,12 +650,19 @@ await ta('面板：单按钮挂到「在本地打开」左边且间距取容器 
   assert.match(style, /#lmc-tools \{ display: inline-flex; align-items: center; gap: 8px; \}/,
     '组内间距与容器的 gap 一致')
 
-  // ⑥ 弹窗不常驻：不占布局 + 自动收起 + 点它收起 + Esc 收起
+  // ⑥ 弹窗不常驻：不占布局 + 自动收起 + Esc 收起 + **右上角的叉**（而不是"整块可点"）
   assert.match(style, /#lmc-box \{ position: fixed/, '弹窗必须 fixed，否则会顶开页面')
   assert.match(script, /const AUTO_HIDE_MS = 4321;/, 'autoHideMs 要真的流进注入脚本')
   assert.match(script, /setTimeout\(hideBox, AUTO_HIDE_MS\)/)
-  assert.match(script, /box\.addEventListener\('click', hideBox\)/)
   assert.match(script, /event\.key === 'Escape'/)
+  assert.match(script, /className = 'lmc-close'/, '要有右上角的叉')
+  assert.match(script, /close\.textContent = '×'/)
+  assert.match(script, /close\.setAttribute\('aria-label', '收起'\)/)
+  assert.match(style, /#lmc-box \.lmc-close \{ position: absolute; top: 4px; right: 4px/, '叉固定在右上角')
+  assert.match(style, /#lmc-body \{[^}]*overflow: auto/, '正文自己滚，叉不跟着滚走')
+  assert.doesNotMatch(script, /box\.addEventListener\('click', hideBox\)/, '整块弹窗不再可点')
+  assert.doesNotMatch(script, /点这里/, '那行「点这里…」提示已去掉')
+  assert.doesNotMatch(style, /#lmc-box \{[^}]*cursor: pointer/, '外框不该长得像个按钮')
 })
 
 await ta('端到端：dry=1 只看不写', async () => {
