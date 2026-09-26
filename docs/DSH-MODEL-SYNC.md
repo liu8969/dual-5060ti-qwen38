@@ -39,11 +39,11 @@ models:
 
 ## 3. 新一代：`local-models-connect.v1`
 
-源码：[`../dsh-plugin/local-models-connect.v9.mjs`](../dsh-plugin/local-models-connect.v9.mjs)
-测试：[`../dsh-plugin/tests/local-models-connect.test.mjs`](../dsh-plugin/tests/local-models-connect.test.mjs)（81 条，`node dsh-plugin/tests/local-models-connect.test.mjs`）
+源码：[`../dsh-plugin/local-models-connect.v10.mjs`](../dsh-plugin/local-models-connect.v10.mjs)
+测试：[`../dsh-plugin/tests/local-models-connect.test.mjs`](../dsh-plugin/tests/local-models-connect.test.mjs)（84 条，`node dsh-plugin/tests/local-models-connect.test.mjs`）
 面板验证台：[`../dsh-plugin/tests/panel-harness.mjs`](../dsh-plugin/tests/panel-harness.mjs)（起一个仿真的会话头部 + 桩路由，供真浏览器驱动；真 GUI 要 token，而凭据不进 agent 命令）
 
-装到 `~/.dsh/plugins/local-models-connect.v9.mjs`，并在
+装到 `~/.dsh/plugins/local-models-connect.v10.mjs`，并在
 `~/.dsh/profiles/web/cordis.patch.yml` 里挂一条（见 §6）。**它取代了 `local-models-sync.v1`**。
 
 它做三件事：
@@ -124,7 +124,26 @@ models:
 | `POST` | `/local-models-connect/run` | 发现 + 接入；加 `?dry=1` 只看不写 |
 | `GET`/`POST` | `/local-models-connect/selfcheck` | 只读自检 |
 | `POST` | `/local-models-connect/panel` | **面板用的那一条**：run + selfcheck 跑完，直接回"三个块"的视图（见 §4.1） |
+| `GET`/`POST` | `/local-models-connect/watch` | **状态点轮询用**：只回 `{ verdict, at, summary }`，不写任何东西，**刻意不套 `singleFlight`**（见 §4.2） |
 | `POST` | `/local-models-sync/run` | **v1 的旧路径留作别名**，行为同 `run` |
+
+### 4.2 状态点为什么需要一条自己的路
+
+状态点早先只在两个时刻更新：页面加载读一次 `/state` 缓存、以及你点按钮之后。于是**后端断了点还绿着、
+后端回来了点还红着**，都得手动点一下才刷新（2026-09-27 用户报的）。现在页面按 `watchIntervalMs`
+（默认 15 秒）打 `/watch`，标签页重新可见 / 窗口获得焦点时立刻补一次。
+
+两个不显然的点：
+
+1. **`/watch` 不能复用 `/selfcheck`**。`singleFlight` 是**没有分键的全局互斥**（`inFlight` 非空就直接
+   返回同一个 promise），所以轮询一旦在飞、用户此时点按钮，`/panel` 会拿到**轮询那份结果** ——
+   面板收到的是一份自检报告而不是 `{ view }`，报告会渲染成空。`/watch` 因此**故意绕过 `singleFlight`**：
+   它只读（`selfCheck` 只读 settings 快照 + 探端点，不写），跟 `runConnect` 并发跑是安全的。
+2. **缓存 TTL 就用 `watchIntervalMs`**：多个标签页一起开时，第一个刷新的那次探测会被其余复用，
+   探测次数不随标签页数量翻倍；单个页面看到的至多是一个轮询周期前的值。
+
+页面侧还有三条护栏：按钮那一下正在跑（`/panel` 含写入）时不插队、上一次没回来不叠第二次、
+页面不可见时不打。所以它不会去跟"写设置"抢。
 
 ```bash
 curl -sS -X POST http://127.0.0.1:3080/local-models-connect/run | python3 -m json.tool
@@ -140,7 +159,9 @@ curl -sS http://127.0.0.1:3080/local-models-connect/selfcheck | python3 -m json.
   **一个** `POST /panel`（宿主侧先 run 再 selfcheck，顺序不能反 —— 自检要反映**写完之后**的声明），
   回一份排好版的视图。只读能力没有消失，只是不再占一个按钮：CLI 的 `GET /selfcheck`、
   `?dry=1`、`config.autoApply:false` 都还在，开机自动探测也仍旧跑。
-* 按钮带一个状态点（最近一次自检的 verdict：绿/黄/红）。
+* 按钮带一个状态点（最近一次自检的 verdict：绿/黄/红）。**它会自己更新**，不用点按钮 ——
+  页面按 `watchIntervalMs` 打只读的 `/watch`，切回标签页 / 窗口获得焦点时立刻补一次（见 §4.2）。
+  所以后端断了点会自己变红、后端回来了会自己变绿。
 * 度量照抄 `dsh-client-ui-open-in-app` 的 28px 高 / 14px 圆角 / `.5px` `border-l4` /
   11px·16px 字 / 同 padding，并复用同一批 `--dsw-alias-*` 令牌 —— 深浅色主题、hover、
   disabled 都跟着 DSH 走。
@@ -277,7 +298,7 @@ v1 只强制引擎**广告出来的事实**（`contextWindow` / `maxTokens` 上�
 ```yaml
 - insert:
     - id: local-models-connect
-      name: "/home/lcy/.dsh/plugins/local-models-connect.v9.mjs"
+      name: "/home/lcy/.dsh/plugins/local-models-connect.v10.mjs"
       config:
         hosts: ['192.168.0.119']          # 种子主机：唯一的扫描范围，要加机器改这一行
         ports: [8080, 8000, 30000, 8081, 11434, 1234]
@@ -303,7 +324,8 @@ v1 只强制引擎**广告出来的事实**（`contextWindow` / `maxTokens` 上�
 | `defaultMaxTokens` | `16384` | 引擎没说最大输出时新条目的 `maxTokens` |
 | `allowPublic` | `false` | 是否允许探测公网端点 |
 | `autoProbeDelayMs` | `4000` | 自动探测的延迟（让 dsh web 先把页面服务起来） |
-| `autoHideMs` | `12000` | 报告弹窗自动收起的时间；`0` = 不自动收（仍可点掉 / 按 Esc） |
+| `autoHideMs` | `12000` | 报告弹窗自动收起的时间；`0` = 不自动收（叉 / Esc 仍可收） |
+| `watchIntervalMs` | `15000` | 状态点自己刷新的节奏（同时是 `/watch` 的缓存 TTL）；`0` = 关掉轮询（退回"得点一下才更新"） |
 
 `providerId` / `displayName` / `apiKeyEnv` 支持**显式写空**表示「关掉/自动命名」
 （写成 `''`、`false` 或 `null`）——「没写这个键」才走默认值。
@@ -333,7 +355,7 @@ curl -sS http://127.0.0.1:3080/local-models-connect/state | python3 -m json.tool
 ```bash
 cp ~/.dsh/profiles/web/cordis.patch.yml.bak-before-local-models-connect-<ts> \
    ~/.dsh/profiles/web/cordis.patch.yml
-rm ~/.dsh/plugins/local-models-connect.v9.mjs
+rm ~/.dsh/plugins/local-models-connect.v10.mjs
 ```
 
 `settings.yaml` 的写入是幂等的（值没变就不写），回滚插件不会把设置改回去。
@@ -383,7 +405,7 @@ Cordis 只在 `name`（也就是文件路径）变化时才重新 `import` 模�
   （`接入本地模型`、`__localModelsConnectInstalled`），且注入脚本里没有提前闭合的 `</script>`；
 * `POST /run?dry=1` → `wrote: false`，一个字节都没写。
 
-回归测试 81 条全过（纯逻辑 39 + 假引擎探测 6 + 端到端 19 + 面板排版 16 + 实机冒烟 1 —— 数出来的
+回归测试 84 条全过（纯逻辑 39 + 假引擎探测 6 + 端到端 22 + 面板排版 16 + 实机冒烟 1 —— 数出来的
 是这样，不是估的）。真机 192.168.0.119:8080 冒烟：识别为 `vllm`，`Qwen3.8-27B-Q6-dual-5060ti`，
 上下文 150000，KV 池 157,824（= 文档里那个数，见下面「一次误判」）。
 
@@ -408,8 +430,7 @@ Cordis 只在 `name`（也就是文件路径）变化时才重新 `import` 模�
 v5（单按钮版）：
 
 * `#lmc-tools` 是容器的**直接子项**、且是 open-in-app 那条 slot 条目的**前一个兄弟**；
-  与左邻条的间距 **8px**、与右侧分体控件条目的间距 **8px** —— 都是容器自己的 `gap`；
-* 只有一个 `.lmc-btn`（标签「接入本地模型」），计算样式 `28px | 14px | 11px | 16px | 5px 10px | 1px`，
+  与左邻条的间距 **8px**、与右侧分体控件条目的间距 **8px** —— 都是容器自己的 `gap`；* 只有一个 `.lmc-btn`（标签「接入本地模型」），计算样式 `28px | 14px | 11px | 16px | 5px 10px | 1px`，
   与原生分体控件容器同档（它也是 28px 高 / 14px 圆角 / `.5px` 边框渲染成 1px）；
 * 一次点击 = 3 个请求（`state` → `run` → `selfcheck`），报告是**一段**：接入行在上、
   `—— 自检 WARN：4 通过 · 2 提醒 · 0 失败` 汇总行在下，**ok 的条目被滤掉**、warn 的明细保留；
@@ -445,6 +466,27 @@ v5（单按钮版）：
 * 叉仍然关得掉（`closedByX: true`），动态渲染后 **0 条 console 错误**。
 
 真机 `POST /panel` 的返回与上面逐字一致（见 §9 开头那三段 `【…】`）。
+
+### 状态点自刷新实测（2026-09-27，真浏览器）
+
+用户报：后端断掉时点还是绿的、后端回来了点还是红的，**都得手动点一下才刷新**。
+根因就是状态点只在「页面加载读 `/state` 缓存」和「点击后」两个时刻更新，没有任何东西在看着后端。
+
+加完之后，验证台给桩加了个控制面 `GET /__verdict?level=ok|warn|fail`，把轮询调成 **1.2 秒**，
+然后在**零点击**的前提下拨后端：
+
+| 动作 | 观察到的点 |
+|---|---|
+| 页面加载（后端 ok） | `lmc-dot ok` |
+| `?level=fail`，等 3 秒 | `lmc-dot fail` ← **自己变红** |
+| `?level=ok`，等 3 秒 | `lmc-dot ok` ← **自己变绿** |
+
+同一轮里还确认：弹窗**没有被轮询打开**（`boxOpen: false`）；此后点一次按钮仍然正常 ——
+三块视图（`接入检查 / 模型列表 / 自检`）、15 行、每行一根状态点、按钮回到可点。
+0 条 console 错误。测试从 65 条加到 **84 条**（分档实测：端到端 19 → 22），其中两条专门钉住这次的东西：
+`watchVerdict` 的「TTL 内不重探 / 过期后重探并翻转」，以及
+**「轮询在飞时点按钮，`/panel` 不会被轮询那份结果劫持」**（用慢引擎制造飞行窗口；
+不套 `singleFlight` 才过得了）。
 
 **上一批修掉的一个真 bug**：弹窗原本用 `max-width` + shrink-to-fit，于是「可用宽度」会被上一次
 写下的 `left` 截断 —— 量到的是「剩下的空间」而不是内容宽度，每次重排都把弹窗再往左推一截

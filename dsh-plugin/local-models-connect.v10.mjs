@@ -90,7 +90,7 @@ export const name = 'local-models-connect'
 export const inject = ['webServer', 'settings']
 
 /** 版本号 —— 自检报告里回显，方便确认页面上跑的是哪一版。 */
-const VERSION = '1.7.1'
+const VERSION = '1.8.0'
 
 /** 写入的设置命名空间（`llm-pi-ai` 的注册者见 dsh-llm-pi-ai）。 */
 const NS = 'llm-pi-ai'
@@ -101,6 +101,16 @@ const ROUTE_RUN = '/local-models-connect/run'
 const ROUTE_SELFCHECK = '/local-models-connect/selfcheck'
 /** 面板用的一条路：run + selfcheck 跑完，直接回「排版好的三块视图」（见 buildPanelView）。 */
 const ROUTE_PANEL = '/local-models-connect/panel'
+/**
+ * 状态点轮询用的一条路：只回一个很小的 `{ verdict, at, summary }`，不写任何东西。
+ *
+ * 为什么不复用 ROUTE_SELFCHECK：那条路走 `singleFlight`，而 `singleFlight` 是**没有分键的
+ * 全局互斥**（同一个 inFlight 直接复用）。轮询一旦在飞，用户此时点按钮，`/panel` 会拿到
+ * 轮询那个 promise 的结果 —— 于是面板收到的是一份自检报告而不是 `{ view }`，报告渲染成空。
+ * 所以这条路**故意绕过 singleFlight**：它只读，跟 runConnect 并发跑是安全的
+ * （selfCheck 只读 settings 快照 + 探端点，不写）。
+ */
+const ROUTE_WATCH = '/local-models-connect/watch'
 const LEGACY_ROUTE_RUN = '/local-models-sync/run'
 
 /** 只碰内网 / 回环端点，避免拿没配 key 的远端 API 去试。 */
@@ -180,7 +190,16 @@ const DEFAULT_CONFIG = {
    * 详细报告自动收起的时间（毫秒）。0 = 不自动收（只留手动点掉）。
    * 报告是 fixed 定位、不占布局，但一块大字盖在页面上同样烦人 —— 默认 12 秒自己消失。
    */
-  autoHideMs: 12000
+  autoHideMs: 12000,
+  /**
+   * 状态点多久自己刷新一次（毫秒）。0 = 关掉轮询（那就退回"得点一下才更新"的旧行为）。
+   *
+   * 之前状态点只在两个时刻变：页面加载时读一次 `/state` 的缓存、以及你点按钮之后。
+   * 结果就是：后端断了点还绿着、后端回来了点还红着，都得手动点一下 —— 2026-09-27 用户报的。
+   * 现在页面按这个节奏打 `ROUTE_WATCH`（只读、不写设置），并且标签页重新可见 / 窗口获得焦点时
+   * 立刻补一次，所以切回来看到的就是当下的状态。
+   */
+  watchIntervalMs: 15000
 }
 
 const msg = (error) => (error && error.message) || String(error)
@@ -266,7 +285,10 @@ export function resolveConfig(raw) {
     autoProbeDelayMs: asPositiveInt(source.autoProbeDelayMs, DEFAULT_CONFIG.autoProbeDelayMs),
     autoHideMs: Number.isFinite(Number(source.autoHideMs)) && Number(source.autoHideMs) >= 0
       ? Math.floor(Number(source.autoHideMs))
-      : DEFAULT_CONFIG.autoHideMs
+      : DEFAULT_CONFIG.autoHideMs,
+    watchIntervalMs: Number.isFinite(Number(source.watchIntervalMs)) && Number(source.watchIntervalMs) >= 0
+      ? Math.floor(Number(source.watchIntervalMs))
+      : DEFAULT_CONFIG.watchIntervalMs
   }
 }
 
@@ -1100,6 +1122,30 @@ function singleFlight(job) {
   return inFlight
 }
 
+/**
+ * 轮询用：返回**当下**的 verdict，只读、不写设置、不走 singleFlight（理由见 ROUTE_WATCH）。
+ *
+ * 缓存 TTL 就用 `watchIntervalMs`：多个标签页一起打开时，第一个刷新的那次探测会被其余复用，
+ * 所以探测次数不会随标签页数量翻倍；而单个页面看到的值最多也就是一个轮询周期前的。
+ */
+async function watchVerdict(ctx, config) {
+  const ttl = config.watchIntervalMs
+  const cached = cache.selfCheck
+  const age = cached === null ? Infinity : Date.now() - Date.parse(cached.at)
+  if (!(age < ttl)) {
+    try {
+      await selfCheck(ctx, config)
+    } catch (error) {
+      // 自检自己都跑不起来（例如 settings 服务异常）→ 如实报 fail，别拿旧值糊过去。
+      ctx.logger.warn('local-models-connect: 轮询自检失败：%s', msg(error))
+      return { ok: false, version: VERSION, verdict: 'fail', at: null, error: msg(error) }
+    }
+  }
+  const latest = cache.selfCheck
+  if (latest === null) return { ok: false, version: VERSION, verdict: 'fail', at: null, note: '自检还没跑过' }
+  return { ok: true, version: VERSION, verdict: latest.verdict, at: latest.at, summary: latest.summary }
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // 面板视图：把两份报告压成「三个块 + 每行一个状态点」
 // ─────────────────────────────────────────────────────────────────────────
@@ -1359,19 +1405,21 @@ const PANEL_STYLE = `
 `
 
 /**
- * 页面脚本。`autoHideMs` 是唯一的注入参数 —— 用一个函数包着，而不是把配置塞进模块级常量：
- * 常量在模块加载时就定死了，config 改了脚本不会跟着变。
+ * 页面脚本。注入参数：`autoHideMs`（报告自动收起）与 `watchIntervalMs`（状态点轮询节奏）。
+ * 用一个函数包着，而不是把配置塞进模块级常量：常量在模块加载时就定死了，config 改了脚本不会跟着变。
  */
-function panelScript(autoHideMs) {
+function panelScript(autoHideMs, watchIntervalMs) {
   return `(() => {
   const ID = 'lmc-tools';
   const BOX_ID = 'lmc-box';
   const BODY_ID = 'lmc-body';
   const API = {
     state: ${JSON.stringify(ROUTE_STATE)},
-    panel: ${JSON.stringify(ROUTE_PANEL)}
+    panel: ${JSON.stringify(ROUTE_PANEL)},
+    watch: ${JSON.stringify(ROUTE_WATCH)}
   };
   const AUTO_HIDE_MS = ${Number(autoHideMs)};
+  const WATCH_MS = ${Number(watchIntervalMs)};
 
   if (window.__localModelsConnectInstalled) return;
   window.__localModelsConnectInstalled = true;
@@ -1379,6 +1427,7 @@ function panelScript(autoHideMs) {
   let tools = null, box = null, body = null, dot = null;
   let runButton = null, runLabel = null;
   let hideTimer = null, observerTimer = null, pendingVerdict = null;
+  let watchTimer = null, watching = false, busy = false;
 
   // ── 报告区：fixed 定位，绝不占布局 ──
   function hideBox() {
@@ -1433,6 +1482,42 @@ function panelScript(autoHideMs) {
   function setDot(level) {
     pendingVerdict = level || null;
     if (dot !== null) dot.className = 'lmc-dot' + (pendingVerdict ? ' ' + pendingVerdict : '');
+  }
+
+  /**
+   * 轮询一次当下的 verdict（只读）。三条护栏：
+   *   · busy：按钮那一下正在跑（/panel 里含写入）时不插队；
+   *   · watching：上一次还没回来就不叠第二次；
+   *   · 页面不可见时不打 —— 省流量，也没人看。
+   * 后端断了点变红、后端回来了点变绿，都靠这个循环；visibilitychange / focus 会立刻补一次，
+   * 所以从别的窗口切回来时看到的是当下的状态，不用手动点。
+   * （注意：本段整体活在模板字符串里，注释里不能出现反引号。）
+   */
+  async function watchOnce() {
+    if (WATCH_MS <= 0 || watching || busy) return;
+    if (typeof document.visibilityState === 'string' && document.visibilityState === 'hidden') return;
+    watching = true;
+    try {
+      const payload = await post(API.watch);
+      if (payload && payload.error) setDot('fail');
+      else if (payload) setDot(payload.verdict);
+    } catch (error) {
+      // 连宿主都打不通 —— 自己就是"异常"，报红比留着旧颜色诚实。
+      setDot('fail');
+    } finally {
+      watching = false;
+    }
+  }
+
+  function startWatch() {
+    if (WATCH_MS <= 0) return;
+    clearInterval(watchTimer);
+    watchTimer = setInterval(watchOnce, WATCH_MS);
+    document.addEventListener('visibilitychange', function () {
+      if (document.visibilityState === 'visible') watchOnce();
+    });
+    window.addEventListener('focus', watchOnce);
+    watchOnce();
   }
 
   async function post(url) {
@@ -1597,10 +1682,15 @@ function panelScript(autoHideMs) {
       invoke(runButton, runLabel, '接入中…', '接入本地模型', async function () {
         // 一个请求拿回「三块视图」；run 与 selfcheck 都在宿主侧按正确顺序跑完了
         // （run 可能写设置，自检要反映**写完之后**的声明）。
-        const payload = await post(API.panel);
-        const view = payload && payload.view ? payload.view : null;
-        setDot(view ? view.verdict : 'fail');
-        showView(view, payload && payload.error);
+        busy = true;
+        try {
+          const payload = await post(API.panel);
+          const view = payload && payload.view ? payload.view : null;
+          setDot(view ? view.verdict : 'fail');
+          showView(view, payload && payload.error);
+        } finally {
+          busy = false;
+        }
       });
     });
 
@@ -1653,19 +1743,20 @@ function panelScript(autoHideMs) {
     hideBox();
   }, true);
 
-  // 页面加载时只读缓存（不打网络）：状态点是热的。
+  // 页面加载时先用只读缓存把点画热（不打网络），随后 startWatch() 会立刻补一次**当下**的值。
   fetch(API.state, { headers: { accept: 'application/json' } })
     .then(function (response) { return response.json(); })
     .then(function (state) {
       if (state && state.lastSelfCheck) setDot(state.lastSelfCheck.verdict);
     })
     .catch(function () {});
+  startWatch();
 })();`
 }
 
 function injectPanel(table, config) {
   table.push({ kind: 'style', text: PANEL_STYLE })
-  table.push({ kind: 'script', placement: 'head', text: panelScript(config.autoHideMs) })
+  table.push({ kind: 'script', placement: 'head', text: panelScript(config.autoHideMs, config.watchIntervalMs) })
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1682,7 +1773,7 @@ function sendJson(res, status, payload) {
   res.end(body)
 }
 
-export { runConnect, selfCheck, ROUTE_STATE, ROUTE_RUN, ROUTE_SELFCHECK, ROUTE_PANEL, LEGACY_ROUTE_RUN, VERSION }
+export { runConnect, selfCheck, watchVerdict, ROUTE_STATE, ROUTE_RUN, ROUTE_SELFCHECK, ROUTE_PANEL, ROUTE_WATCH, LEGACY_ROUTE_RUN, VERSION }
 
 export function apply(ctx, pluginConfig) {
   const config = resolveConfig(pluginConfig)
@@ -1717,6 +1808,7 @@ export function apply(ctx, pluginConfig) {
         prune: config.prune,
         adoptUnknownContext: config.adoptUnknownContext,
         autoHideMs: config.autoHideMs,
+        watchIntervalMs: config.watchIntervalMs,
         probeTimeoutMs: config.probeTimeoutMs
       },
       lastRun: cache.run,
@@ -1763,6 +1855,14 @@ export function apply(ctx, pluginConfig) {
       })
     })
   }), 'local-models-connect: panel route')
+
+  ctx.effect(() => ctx.webServer.register({
+    kind: 'exact',
+    path: ROUTE_WATCH,
+    // 故意**不**套 singleFlight：轮询只读，跟 /panel 的写入并发跑是安全的；
+    // 套了反而会让同时在跑的 /panel 拿到轮询那份结果（见 ROUTE_WATCH 注释）。
+    handler: guard(async () => await watchVerdict(ctx, config))
+  }), 'local-models-connect: watch route')
 
   ctx.on('webserver/index-inject', (table) => injectPanel(table, config))
 

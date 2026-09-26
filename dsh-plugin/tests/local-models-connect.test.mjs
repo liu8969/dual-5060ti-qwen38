@@ -6,13 +6,13 @@
  *   4. 实机冒烟：真打 192.168.0.119:8080（不在线只记 warn，不算失败）。
  *
  * 跑法：node dsh-plugin/tests/local-models-connect.test.mjs [插件路径]
- *       （不给路径就测同仓库的 ../local-models-connect.v9.mjs）
+ *       （不给路径就测同仓库的 ../local-models-connect.v10.mjs）
  */
 import assert from 'node:assert/strict'
 import http from 'node:http'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
-const MODULE_PATH = process.argv[2] ?? fileURLToPath(new URL('../local-models-connect.v9.mjs', import.meta.url))
+const MODULE_PATH = process.argv[2] ?? fileURLToPath(new URL('../local-models-connect.v10.mjs', import.meta.url))
 const plugin = await import(pathToFileURL(MODULE_PATH).href)
 
 let pass = 0
@@ -69,6 +69,18 @@ const vllmEngine = () => fakeEngine((req, res) => {
         root: '/home/lcy/Models/Merkyor-W4A4/NVFP4/W4A4', max_model_len: 150000
       }]
     })
+  }
+  if (req.url === '/health') return json(res, 200, { status: 'ok' })
+  json(res, 404, {})
+})
+
+/** 慢引擎：用来制造「一个请求还在飞」的窗口（验全局互斥那条坑）。 */
+const slowVllmEngine = (delayMs) => fakeEngine((req, res) => {
+  if (req.url === '/v1/models') {
+    return setTimeout(() => json(res, 200, {
+      object: 'list',
+      data: [{ id: 'Qwen3.8-27B-Q6-dual-5060ti', object: 'model', owned_by: 'vllm', max_model_len: 150000 }]
+    }), delayMs)
   }
   if (req.url === '/health') return json(res, 200, { status: 'ok' })
   json(res, 404, {})
@@ -551,11 +563,11 @@ await ta('probeTarget：列表结构不对 → reachable 但带读不动的 erro
 
 section('3. 端到端')
 
-await ta('apply：注册 5 条路由，注入 style + script 两行，且启动日志有版本号', async () => {
+await ta('apply：注册 6 条路由，注入 style + script 两行，且启动日志有版本号', async () => {
   const host = makeHost()
   plugin.apply(host.ctx, { autoProbe: false })
   assert.deepEqual([...host.routes.keys()].sort(),
-    [plugin.ROUTE_RUN, plugin.ROUTE_SELFCHECK, plugin.ROUTE_STATE, plugin.ROUTE_PANEL, plugin.LEGACY_ROUTE_RUN].sort())
+    [plugin.ROUTE_RUN, plugin.ROUTE_SELFCHECK, plugin.ROUTE_STATE, plugin.ROUTE_PANEL, plugin.ROUTE_WATCH, plugin.LEGACY_ROUTE_RUN].sort())
   const table = []
   for (const inject of host.injects) if (inject.event === 'webserver/index-inject') inject.fn(table)
   assert.equal(table.length, 2)
@@ -687,6 +699,100 @@ await ta('端到端：dry=1 只看不写', async () => {
     assert.equal(host.mutations.length, 0, 'dry-run 一个字节都不能写')
     assert.equal(host.state.section['llm-pi-ai'], undefined)
   } finally { await web.close(); await vllm.close() }
+})
+
+await ta('端到端：状态点会自己刷新（watch 轮询）—— 两条护栏 + 打的是只读那条路', async () => {
+  const vllm = await vllmEngine()
+  // 声明与引擎一致的 provider：这样自检是绿灯，正对"点该是绿的"那个场景
+  const host = makeHost({
+    'llm-pi-ai': {
+      providers: {
+        'qwen-local': {
+          api: 'openai-completions', baseURL: `${vllm.origin}/v1`,
+          models: [{ id: 'Qwen3.8-27B-Q6-dual-5060ti', contextWindow: 150000, maxTokens: 16384 }]
+        }
+      }
+    }
+  })
+  plugin.apply(host.ctx, {
+    autoProbe: false, hosts: ['127.0.0.1'], ports: [vllm.port], includeConfigured: false,
+    autoHideMs: 4321, watchIntervalMs: 7000
+  })
+  const table = []
+  for (const inject of host.injects) if (inject.event === 'webserver/index-inject') inject.fn(table)
+  const script = table.find((r) => r.kind === 'script').text
+
+  // ① 节奏真的流进注入脚本，并且确实起了定时器
+  assert.match(script, /const WATCH_MS = 7000;/, 'watchIntervalMs 要真的流进脚本')
+  assert.match(script, /setInterval\(watchOnce, WATCH_MS\)/)
+  assert.match(script, /if \(WATCH_MS <= 0 \|\| watching \|\| busy\) return;/, '三条护栏：关掉 / 不叠 / 按钮在跑时不插队')
+  assert.match(script, /document\.visibilityState === 'hidden'\) return;/, '页面不可见时不打')
+  // ② 切回来立刻补一次 —— 这正是"不用手动点"的关键
+  assert.match(script, /addEventListener\('visibilitychange'/)
+  assert.match(script, /addEventListener\('focus', watchOnce\)/)
+  assert.match(script, /  startWatch\(\);/)
+  // ③ 打的是**只读**那条 watch 路，不是 /panel（会写设置），也不是 /selfcheck（走全局互斥）
+  assert.match(script, new RegExp(`watch: ${JSON.stringify(plugin.ROUTE_WATCH).replace(/[/-]/g, '\\$&')}`))
+  assert.match(script, /await post\(API\.watch\)/)
+  assert.doesNotMatch(script, /await post\(API\.selfcheck\)/)
+
+  // ④ 真的能拿到 verdict（不是只写了段死代码）
+  const web = await serveRoutes(host.routes)
+  try {
+    const watch = await web.get(plugin.ROUTE_WATCH)
+    assert.equal(watch.status, 200)
+    assert.equal(watch.body.verdict, 'ok')
+    assert.ok(watch.body.at, '要带时间戳，否则用户不知道这个点有多旧')
+    assert.equal(watch.body.view, undefined, 'watch 只回小载荷，不回三块视图')
+  } finally { await web.close(); await vllm.close() }
+})
+
+await ta('轮询：TTL 内复用缓存不重探；过期后重探并跟着后端翻转', async () => {
+  // 一台可以"拔线"的引擎：拔线后连接被掐（探不到），但仍能记到 hits ——
+  // 这样「有没有重探」这件事才量得出来（直接 close 掉引擎就一起把计数弄没了）。
+  let engineUp = true
+  const vllm = await fakeEngine((req, res) => {
+    if (!engineUp) { req.socket.destroy(); return }
+    if (req.url === '/v1/models') {
+      return json(res, 200, {
+        object: 'list',
+        data: [{ id: 'Qwen3.8-27B-Q6-dual-5060ti', object: 'model', owned_by: 'vllm', max_model_len: 150000 }]
+      })
+    }
+    if (req.url === '/health') return json(res, 200, { status: 'ok' })
+    json(res, 404, {})
+  })
+  const host = makeHost({
+    'llm-pi-ai': {
+      providers: {
+        'qwen-local': {
+          api: 'openai-completions', baseURL: `${vllm.origin}/v1`,
+          models: [{ id: 'Qwen3.8-27B-Q6-dual-5060ti', contextWindow: 150000, maxTokens: 16384 }]
+        }
+      }
+    }
+  })
+  const config = plugin.resolveConfig({
+    autoProbe: false, hosts: ['127.0.0.1'], ports: [vllm.port], includeConfigured: false,
+    watchIntervalMs: 60000, probeTimeoutMs: 500
+  })
+  try {
+    // 先跑一次自检，把缓存做热
+    const first = await plugin.watchVerdict(host.ctx, config)
+    assert.equal(first.verdict, 'ok')
+    const hitsAfterFirst = vllm.hits.length
+
+    // 后端"拔线"：TTL 内不该重探 → 仍然回缓存里的 ok，且一次探测都没发
+    engineUp = false
+    const cached = await plugin.watchVerdict(host.ctx, config)
+    assert.equal(cached.verdict, 'ok', 'TTL 内复用缓存，不重探')
+    assert.equal(vllm.hits.length, hitsAfterFirst, 'TTL 内一次探测都不该发')
+
+    // TTL 过期（用 0 逼它立刻重探）→ 真的去探了，verdict 跟着翻成 fail
+    const forced = await plugin.watchVerdict(host.ctx, { ...config, watchIntervalMs: 0 })
+    assert.equal(forced.verdict, 'fail', '重探之后要反映"后端断了"')
+    assert.ok(vllm.hits.length > hitsAfterFirst, '过期后必须重探')
+  } finally { await vllm.close().catch(() => {}) }
 })
 
 await ta('端到端：GET 打 run → 明确报错（写操作只收 POST）', async () => {
@@ -1175,6 +1281,30 @@ await ta('端到端：POST /panel 回来的就是三块的视图（客户端照�
     const notPost = await web.get(plugin.ROUTE_PANEL)
     assert.equal(notPost.body.ok, false)
     assert.match(notPost.body.error, /只接受 POST/)
+  } finally { await web.close(); await vllm.close() }
+})
+
+await ta('端到端：轮询在飞时点按钮，/panel 不会被轮询那份结果劫持（全局互斥的坑）', async () => {
+  // singleFlight 是**没有分键的全局互斥**：谁先飞，后来者直接复用同一个 promise。
+  // 所以如果 /watch 也走 singleFlight，轮询在飞时点按钮，/panel 就会拿到
+  // { verdict, at, summary } 而不是 { view } —— 面板渲染成空。这条测试钉住"不套"。
+  const vllm = await slowVllmEngine(300)
+  const host = makeHost()
+  plugin.apply(host.ctx, {
+    autoProbe: false, hosts: ['127.0.0.1'], ports: [vllm.port], includeConfigured: false,
+    watchIntervalMs: 0, probeTimeoutMs: 3000   // 0 = 每次都真探，保证 watch 真的在飞
+  })
+  const web = await serveRoutes(host.routes)
+  try {
+    const flying = web.get(plugin.ROUTE_WATCH)
+    await new Promise((resolve) => setTimeout(resolve, 60))   // 让 watch 先进入飞行状态
+    const panel = await web.get(plugin.ROUTE_PANEL, { method: 'POST' })
+    const watch = await flying
+
+    assert.ok(panel.body.view, '/panel 必须拿回三块视图，而不是被轮询的结果顶掉')
+    assert.equal(panel.body.view.verdict, 'ok')
+    assert.equal(typeof watch.body.verdict, 'string', '/watch 回自己的小载荷')
+    assert.equal(watch.body.view, undefined)
   } finally { await web.close(); await vllm.close() }
 })
 

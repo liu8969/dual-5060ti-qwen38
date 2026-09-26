@@ -22,8 +22,10 @@ import http from 'node:http'
 import { writeFileSync } from 'node:fs'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
-const MODULE = process.argv[2] ?? fileURLToPath(new URL('../local-models-connect.v9.mjs', import.meta.url))
+const MODULE = process.argv[2] ?? fileURLToPath(new URL('../local-models-connect.v10.mjs', import.meta.url))
 const AUTO_HIDE_MS = Number(process.argv[3] ?? 9000)
+// 第 3 个参数之后是端口；状态点轮询节奏另给一个环境变量，方便把它调短来验「自己变红/变绿」
+const WATCH_MS = Number(process.env.LMC_WATCH_MS ?? 15000)
 const PORT = Number(process.argv[4] ?? 18181)
 // 第 5 个参数：端口行数（'long' = 60）。用来验「内容高于视口下方空间」与「比整个视口还高」两条退路。
 const ROWS_ARG = process.argv[5] ?? ''
@@ -40,7 +42,7 @@ const host = {
   webServer: { register: () => () => {} },
   settings: { section: () => undefined, mutate: async () => {} }
 }
-plugin.apply(host, { autoProbe: false, hosts: ['127.0.0.1'], ports: [1], includeConfigured: false, autoHideMs: AUTO_HIDE_MS })
+plugin.apply(host, { autoProbe: false, hosts: ['127.0.0.1'], ports: [1], includeConfigured: false, autoHideMs: AUTO_HIDE_MS, watchIntervalMs: WATCH_MS })
 
 const style = table.find((r) => r.kind === 'style').text
 const script = table.find((r) => r.kind === 'script').text
@@ -124,16 +126,35 @@ const RUN = {
   providers: [{ provider: 'qwen-local', baseURL: 'http://192.168.0.119:8080/v1', action: 'unchanged', changes: [], modelCount: 1 }]
 }
 
+/**
+ * 当前"后端"的 verdict —— 可以用 `GET /__verdict?level=fail` 实时改，
+ * 用来验「状态点会不会自己跟着变」（不用点任何按钮）。
+ */
+let verdict = 'ok'
+
 const hits = []
 const server = http.createServer((req, res) => {
-  const path = new URL(req.url, 'http://localhost').pathname
+  const url = new URL(req.url, 'http://localhost')
+  const path = url.pathname
   hits.push(`${req.method} ${path}`)
   const send = (body) => {
     res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' })
     res.end(JSON.stringify(body))
   }
+  // 控制面：把「后端」拨到某个状态（ok / warn / fail），返回上一次的值
+  if (path === '/__verdict') {
+    const wanted = url.searchParams.get('level')
+    const before = verdict
+    if (wanted !== null) verdict = wanted
+    console.log(`[control] verdict ${before} -> ${verdict}`)
+    return send({ before, now: verdict })
+  }
   if (path === '/local-models-connect/state') {
-    return send({ ok: true, version: '1.6.0', config: {}, lastRun: null, lastSelfCheck: { verdict: 'ok', at: '2026-09-24T00:45:00.000Z' } })
+    return send({ ok: true, version: '1.8.0', config: {}, lastRun: null, lastSelfCheck: { verdict: 'ok', at: '2026-09-24T00:45:00.000Z' } })
+  }
+  if (path === '/local-models-connect/watch') {
+    // 真插件那条轮询路：小载荷、只读
+    return send({ ok: true, version: '1.8.0', verdict, at: new Date().toISOString(), summary: { ok: 6, warn: 0, fail: 0 } })
   }
   if (path === '/local-models-connect/panel') {
     // 用**真插件**的视图构造器，所以这里验的就是要上线的那份排版
@@ -151,5 +172,6 @@ server.listen(PORT, '127.0.0.1', () => {
   console.log(`面板验证台: http://127.0.0.1:${PORT}/`)
   console.log('期望：#lmc-tools 是 .wSkVaW_headerUtilities 的**直接子项**，')
   console.log('      紧邻 .Ss22bb_entry 之前，且两者之间正好 8px（容器 gap）。')
+  console.log('拨后端状态：curl "http://127.0.0.1:' + PORT + '/__verdict?level=fail"')
 })
 process.on('SIGTERM', () => { console.log('hits:', hits.join(' | ')); server.close(() => process.exit(0)) })
