@@ -90,7 +90,7 @@ export const name = 'local-models-connect'
 export const inject = ['webServer', 'settings']
 
 /** 版本号 —— 自检报告里回显，方便确认页面上跑的是哪一版。 */
-const VERSION = '1.8.0'
+const VERSION = '1.8.1'
 
 /** 写入的设置命名空间（`llm-pi-ai` 的注册者见 dsh-llm-pi-ai）。 */
 const NS = 'llm-pi-ai'
@@ -823,6 +823,32 @@ let inFlight = null
 /** 最近一次的报告缓存，供页面 `/state` 免网络读取。 */
 const cache = { run: null, selfCheck: null }
 
+/**
+ * 读一个设置段的**当前值**。
+ *
+ * 为什么不直接写 `ctx.settings.section(ns)`：DSH **0.2.0 换掉了 settings 服务的方法** ——
+ * `section(ns)` 在 0.2.0-rc.2 上根本不存在（服务类只有 describe / update / replace /
+ * mutate / write / schema / configure / invalidate），读值改走 `describe()`：它返回**条目
+ * 描述符数组**，`ns` 是 profile 条目 id、`value` 是投影后的活值。
+ * 症状（2026-10-05 升到 0.2.0-rc.2 后实测）：点「自检」或「接入本地模型」，
+ * 路由回 `{"ok":false,"error":"ctx.settings.section is not a function"}`。
+ *
+ * 留着 `section()` 那条分支是为了兼容还没升级的 0.1.x 宿主（两代同时在跑的那段时间）。
+ * @param {object} ctx - 插件上下文。
+ * @param {string} ns - 设置命名空间（= profile 条目 id，本插件是 `llm-pi-ai`）。
+ * @returns {object} 该段的活值；拿不到就回空对象（调用方都按 `?.` 容错写）。
+ */
+function readSection(ctx, ns) {
+  const svc = ctx.settings
+  if (svc === undefined || svc === null) return {}
+  if (typeof svc.section === 'function') return svc.section(ns) ?? {}
+  if (typeof svc.describe === 'function') {
+    const hit = svc.describe().find((descriptor) => descriptor.ns === ns)
+    if (hit !== undefined && typeof hit.value === 'object' && hit.value !== null) return hit.value
+  }
+  return {}
+}
+
 async function probeAll(config, section) {
   const targets = candidateTargets(config, section)
   const results = await mapLimited(targets, config.concurrency, (target) => {
@@ -839,7 +865,7 @@ async function probeAll(config, section) {
  * @param options.dryRun - true 时只算不写（`?dry=1`）。
  */
 async function runConnect(ctx, config, options = {}) {
-  const section = ctx.settings.section(NS) ?? {}
+  const section = readSection(ctx, NS)
   const dryRun = options.dryRun === true
   const { targets, results } = await probeAll(config, section)
 
@@ -927,7 +953,7 @@ async function runConnect(ctx, config, options = {}) {
  * 判定口径全部落在「可复现的事实」上，不做主观评价。
  */
 async function selfCheck(ctx, config) {
-  const section = ctx.settings.section(NS) ?? {}
+  const section = readSection(ctx, NS)
   const checks = []
   const add = (id, level, title, detail) => checks.push({ id, level, title, detail })
 

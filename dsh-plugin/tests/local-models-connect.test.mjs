@@ -10,9 +10,24 @@
  */
 import assert from 'node:assert/strict'
 import http from 'node:http'
+import { readdirSync } from 'node:fs'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
-const MODULE_PATH = process.argv[2] ?? fileURLToPath(new URL('../local-models-connect.v10.mjs', import.meta.url))
+/**
+ * 默认测「仓库里 v 号最大的那一份」。写死 v10 的话，每次按规矩改名（v10 → v11…）都得回来改
+ * 这一行 —— 而漏改的后果是"测试还在测旧文件、全绿"，正好掩盖掉新版本引入的问题。
+ */
+function latestPluginPath() {
+  const dir = fileURLToPath(new URL('..', import.meta.url))
+  const ranked = readdirSync(dir)
+    .map((name) => [Number((/^local-models-connect\.v(\d+)\.mjs$/.exec(name) ?? [])[1]), name])
+    .filter(([n]) => Number.isInteger(n))
+    .sort((a, b) => a[0] - b[0])
+  if (ranked.length === 0) throw new Error(`同目录里没有 local-models-connect.v<N>.mjs：${dir}`)
+  return fileURLToPath(new URL(`../${ranked[ranked.length - 1][1]}`, import.meta.url))
+}
+
+const MODULE_PATH = process.argv[2] ?? latestPluginPath()
 const plugin = await import(pathToFileURL(MODULE_PATH).href)
 
 let pass = 0
@@ -153,7 +168,12 @@ function makeHost(initialSection = {}, options = {}) {
     get: (name) => (name === 'credentials' ? options.credentials : undefined),
     webServer: { register: (route) => { routes.set(route.path, route); return () => routes.delete(route.path) } },
     settings: {
-      section: (ns) => state.section[ns],
+      // 假宿主按 **0.2.0** 的 settings 服务建模：只有 describe / mutate，**没有** section()。
+      // 这里原来写的是 `section: (ns) => state.section[ns]`（0.1.x 的 API），于是
+      // 「插件调了一个真宿主上不存在的方法」这件事整套测试都看不见 —— 2026-10-05 升到
+      // 0.2.0-rc.2 后点「自检」报 `ctx.settings.section is not a function` 就是这么漏出去的。
+      // 别把它改回 section()：这个 fake 的价值正是"和真宿主同形"。
+      describe: () => Object.entries(state.section).map(([ns, value]) => ({ ns, value })),
       mutate: async (ns, ops) => {
         mutations.push({ ns, ops })
         if (state.section[ns] === undefined || state.section[ns] === null) state.section[ns] = {}
