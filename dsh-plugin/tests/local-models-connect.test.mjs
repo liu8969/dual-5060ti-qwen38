@@ -6,28 +6,13 @@
  *   4. 实机冒烟：真打 192.168.0.119:8080（不在线只记 warn，不算失败）。
  *
  * 跑法：node dsh-plugin/tests/local-models-connect.test.mjs [插件路径]
- *       （不给路径就测同仓库的 ../local-models-connect.v10.mjs）
+ *       （不给路径就测同仓库的 ../local-models-connect.v11.mjs）
  */
 import assert from 'node:assert/strict'
 import http from 'node:http'
-import { readdirSync } from 'node:fs'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
-/**
- * 默认测「仓库里 v 号最大的那一份」。写死 v10 的话，每次按规矩改名（v10 → v11…）都得回来改
- * 这一行 —— 而漏改的后果是"测试还在测旧文件、全绿"，正好掩盖掉新版本引入的问题。
- */
-function latestPluginPath() {
-  const dir = fileURLToPath(new URL('..', import.meta.url))
-  const ranked = readdirSync(dir)
-    .map((name) => [Number((/^local-models-connect\.v(\d+)\.mjs$/.exec(name) ?? [])[1]), name])
-    .filter(([n]) => Number.isInteger(n))
-    .sort((a, b) => a[0] - b[0])
-  if (ranked.length === 0) throw new Error(`同目录里没有 local-models-connect.v<N>.mjs：${dir}`)
-  return fileURLToPath(new URL(`../${ranked[ranked.length - 1][1]}`, import.meta.url))
-}
-
-const MODULE_PATH = process.argv[2] ?? latestPluginPath()
+const MODULE_PATH = process.argv[2] ?? fileURLToPath(new URL('../local-models-connect.v11.mjs', import.meta.url))
 const plugin = await import(pathToFileURL(MODULE_PATH).href)
 
 let pass = 0
@@ -161,6 +146,24 @@ function makeHost(initialSection = {}, options = {}) {
   const effects = []
   const mutations = []
   const logs = []
+  /**
+   * 设置侧的假宿主：照 dsh 0.2.0-rc.2 的 `SettingsForms` 来 —— 只有
+   * `describe()` / `mutate()`，**没有** `section()`（那是 0.1 的私有读法，升级后整个删掉，
+   * 也正是「请求失败：ctx.settings.section is not a function」的来源）。
+   *
+   * `describe()` 一行 = 一个 profile 条目：`user` 是用户层，`value` 是 schema 解析后的活值。
+   * `options.valueLayer` 用来模拟「解析出来的默认值」—— 读错层（拿 value 当现状）的实现
+   * 会把它当成用户写过的东西，这一条由下面的回归用例钉住。
+   */
+  const describe = options.describe ?? (() => {
+    const names = [...new Set([...Object.keys(state.section), ...Object.keys(options.valueLayer ?? {})])]
+    return names.map((ns) => ({
+      ns,
+      user: state.section[ns],
+      value: options.valueLayer?.[ns] ?? state.section[ns] ?? {},
+      revision: 0
+    }))
+  })
   const ctx = {
     logger: { info: (...a) => logs.push(['info', a]), warn: (...a) => logs.push(['warn', a]), debug: () => {} },
     effect: (fn, label) => { effects.push({ label, dispose: fn() }) },
@@ -168,12 +171,7 @@ function makeHost(initialSection = {}, options = {}) {
     get: (name) => (name === 'credentials' ? options.credentials : undefined),
     webServer: { register: (route) => { routes.set(route.path, route); return () => routes.delete(route.path) } },
     settings: {
-      // 假宿主按 **0.2.0** 的 settings 服务建模：只有 describe / mutate，**没有** section()。
-      // 这里原来写的是 `section: (ns) => state.section[ns]`（0.1.x 的 API），于是
-      // 「插件调了一个真宿主上不存在的方法」这件事整套测试都看不见 —— 2026-10-05 升到
-      // 0.2.0-rc.2 后点「自检」报 `ctx.settings.section is not a function` 就是这么漏出去的。
-      // 别把它改回 section()：这个 fake 的价值正是"和真宿主同形"。
-      describe: () => Object.entries(state.section).map(([ns, value]) => ({ ns, value })),
+      describe,
       mutate: async (ns, ops) => {
         mutations.push({ ns, ops })
         if (state.section[ns] === undefined || state.section[ns] === null) state.section[ns] = {}
@@ -629,6 +627,46 @@ await ta('端到端：新环境（没有任何 provider）→ run 建出 provide
     assert.equal(again.body.wrote, false)
     assert.equal(again.body.providers[0].action, 'unchanged')
     assert.equal(host.mutations.length, 1)
+  } finally { await web.close(); await vllm.close() }
+})
+
+await ta('端到端：读设置只走公开口径 describe()，0.2 里根本没有 section() 可调', async () => {
+  const vllm = await vllmEngine()
+  const host = makeHost()
+  assert.equal(typeof host.ctx.settings.section, 'undefined',
+    '假宿主必须照 dsh 0.2 的真实形状来：SettingsForms 只有 describe/update/replace/mutate')
+  plugin.apply(host.ctx, { autoProbe: false, hosts: ['127.0.0.1'], ports: [vllm.port], includeConfigured: false })
+  const web = await serveRoutes(host.routes)
+  try {
+    // /watch 与 /panel 正是按钮打的那两条路，两条都要读设置
+    // （dsh 0.1 → 0.2 升级后它们统一回「请求失败：ctx.settings.section is not a function」）
+    const watch = await web.get(plugin.ROUTE_WATCH, { method: 'POST' })
+    assert.equal(watch.body.error, undefined, `watch 不该报错：${watch.body.error}`)
+
+    const panel = await web.get(plugin.ROUTE_PANEL, { method: 'POST' })
+    assert.equal(panel.body.error, undefined, `panel 不该报错：${panel.body.error}`)
+    assert.equal(panel.body.ok, true)
+    assert.ok(panel.body.view && Array.isArray(panel.body.view.blocks) && panel.body.view.blocks.length > 0,
+      'panel 要回排版好的三块视图')
+    assert.equal(host.state.section['llm-pi-ai'].providers['qwen-local'].models[0].contextWindow, 150000)
+  } finally { await web.close(); await vllm.close() }
+})
+
+await ta('端到端：现状读的是 user 层 —— schema 解析出的默认值不算「用户写过」', async () => {
+  const vllm = await vllmEngine()
+  // user 层空的；解析后的 value 里却有一条同 baseURL 的 provider（模拟 schema 默认值）。
+  // 读 value 的实现会「复用」它、报 unchanged，再顺手把默认值写回用户的 patch。
+  const host = makeHost({}, {
+    valueLayer: { 'llm-pi-ai': { providers: { 'from-defaults': { baseURL: `${vllm.origin}/v1`, models: [] } } } }
+  })
+  plugin.apply(host.ctx, { autoProbe: false, hosts: ['127.0.0.1'], ports: [vllm.port], includeConfigured: false })
+  const web = await serveRoutes(host.routes)
+  try {
+    const run = await web.get(plugin.ROUTE_RUN, { method: 'POST' })
+    assert.equal(run.body.providers[0].provider, 'qwen-local', '默认值不该占掉 provider id')
+    assert.equal(run.body.providers[0].action, 'created')
+    assert.deepEqual(Object.keys(host.state.section['llm-pi-ai'].providers), ['qwen-local'],
+      '写进去的只能是引擎证明过的那一条，不能把默认值一起带进来')
   } finally { await web.close(); await vllm.close() }
 })
 

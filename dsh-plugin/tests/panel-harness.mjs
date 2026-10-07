@@ -22,7 +22,7 @@ import http from 'node:http'
 import { writeFileSync } from 'node:fs'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
-const MODULE = process.argv[2] ?? fileURLToPath(new URL('../local-models-connect.v10.mjs', import.meta.url))
+const MODULE = process.argv[2] ?? fileURLToPath(new URL('../local-models-connect.v11.mjs', import.meta.url))
 const AUTO_HIDE_MS = Number(process.argv[3] ?? 9000)
 // 第 3 个参数之后是端口；状态点轮询节奏另给一个环境变量，方便把它调短来验「自己变红/变绿」
 const WATCH_MS = Number(process.env.LMC_WATCH_MS ?? 15000)
@@ -40,7 +40,7 @@ const host = {
   on: (event, fn) => { if (event === 'webserver/index-inject') fn(table) },
   get: () => undefined,
   webServer: { register: () => () => {} },
-  settings: { section: () => undefined, mutate: async () => {} }
+  settings: { describe: () => [], mutate: async () => {} }
 }
 plugin.apply(host, { autoProbe: false, hosts: ['127.0.0.1'], ports: [1], includeConfigured: false, autoHideMs: AUTO_HIDE_MS, watchIntervalMs: WATCH_MS })
 
@@ -150,11 +150,11 @@ const server = http.createServer((req, res) => {
     return send({ before, now: verdict })
   }
   if (path === '/local-models-connect/state') {
-    return send({ ok: true, version: '1.8.0', config: {}, lastRun: null, lastSelfCheck: { verdict: 'ok', at: '2026-09-24T00:45:00.000Z' } })
+    return send({ ok: true, version: '1.9.0', config: {}, lastRun: null, lastSelfCheck: { verdict: 'ok', at: '2026-09-24T00:45:00.000Z' } })
   }
   if (path === '/local-models-connect/watch') {
     // 真插件那条轮询路：小载荷、只读
-    return send({ ok: true, version: '1.8.0', verdict, at: new Date().toISOString(), summary: { ok: 6, warn: 0, fail: 0 } })
+    return send({ ok: true, version: '1.9.0', verdict, at: new Date().toISOString(), summary: { ok: 6, warn: 0, fail: 0 } })
   }
   if (path === '/local-models-connect/panel') {
     // 用**真插件**的视图构造器，所以这里验的就是要上线的那份排版

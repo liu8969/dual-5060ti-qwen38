@@ -39,11 +39,11 @@ models:
 
 ## 3. 新一代：`local-models-connect.v1`
 
-源码：[`../dsh-plugin/local-models-connect.v10.mjs`](../dsh-plugin/local-models-connect.v10.mjs)
-测试：[`../dsh-plugin/tests/local-models-connect.test.mjs`](../dsh-plugin/tests/local-models-connect.test.mjs)（84 条，`node dsh-plugin/tests/local-models-connect.test.mjs`）
+源码：[`../dsh-plugin/local-models-connect.v11.mjs`](../dsh-plugin/local-models-connect.v11.mjs)
+测试：[`../dsh-plugin/tests/local-models-connect.test.mjs`](../dsh-plugin/tests/local-models-connect.test.mjs)（86 条，`node dsh-plugin/tests/local-models-connect.test.mjs`）
 面板验证台：[`../dsh-plugin/tests/panel-harness.mjs`](../dsh-plugin/tests/panel-harness.mjs)（起一个仿真的会话头部 + 桩路由，供真浏览器驱动；真 GUI 要 token，而凭据不进 agent 命令）
 
-装到 `~/.dsh/plugins/local-models-connect.v10.mjs`，并在
+装到 `~/.dsh/plugins/local-models-connect.v11.mjs`，并在
 `~/.dsh/profiles/web/cordis.patch.yml` 里挂一条（见 §6）。**它取代了 `local-models-sync.v1`**。
 
 它做三件事：
@@ -298,7 +298,7 @@ v1 只强制引擎**广告出来的事实**（`contextWindow` / `maxTokens` 上�
 ```yaml
 - insert:
     - id: local-models-connect
-      name: "/home/lcy/.dsh/plugins/local-models-connect.v10.mjs"
+      name: "/home/lcy/.dsh/plugins/local-models-connect.v11.mjs"
       config:
         hosts: ['192.168.0.119']          # 种子主机：唯一的扫描范围，要加机器改这一行
         ports: [8080, 8000, 30000, 8081, 11434, 1234]
@@ -355,7 +355,7 @@ curl -sS http://127.0.0.1:3080/local-models-connect/state | python3 -m json.tool
 ```bash
 cp ~/.dsh/profiles/web/cordis.patch.yml.bak-before-local-models-connect-<ts> \
    ~/.dsh/profiles/web/cordis.patch.yml
-rm ~/.dsh/plugins/local-models-connect.v10.mjs
+rm ~/.dsh/plugins/local-models-connect.v11.mjs
 ```
 
 `settings.yaml` 的写入是幂等的（值没变就不写），回滚插件不会把设置改回去。
@@ -384,6 +384,11 @@ Cordis 只在 `name`（也就是文件路径）变化时才重新 `import` 模�
 |---|---|---|
 | 只改文件内容（版本号 1.0.0 → 1.1.0），patch 不动 | 仍 `1.0.0` | 内容改动**不会**重载，HMR 不管模块内容 |
 | 新文件名 + 改 patch 里那一行 | 立刻 `1.1.0`，路由全程 200 | patch 一变就重载，**不需要重启 dsh web** |
+
+> ⚠️ **上表第三行是 0.1 的行为，dsh 0.2 起不再成立**（2026-10-07 实测，见文末那一节）：
+> 0.2 的 loader 在 `Entry.update()` 里对「只有 `name` 不同」这种 diff 既不 dispose 也不重新
+> `import`（只有 `config` / `group` 变了才走 `fiber.update`），所以**改 patch 里那一行不会
+> 换掉正在跑的实现** —— 要么重启 `dsh web`，要么借道一个**新的 entry id**（见文末）。
 
 所以 `~/.dsh/plugins/` 里那个软链指向仓库实体只解决「文件同步」，不解决「模块重载」——
 要生效仍须换文件名。仓库里只保留当前那一版（旧版交给 git 历史），否则 `v1`/`v2`/`v3`
@@ -519,3 +524,74 @@ v5（单按钮版）：
 
 插件换版后**刷新一次页面**才会看到新面板 —— 已渲染的页面里还是上一版注入进去的脚本
 （2026-09-24 从「两个按钮」变成「一个按钮」时就是这样）。
+
+### dsh 0.2 删掉了读设置的私有口径 → 按钮报「请求失败」（2026-10-07，v11 / 1.9.0）
+
+**现象**：宿主升级到 `0.2.0-rc.2`（10-05）之后，会话头部那个「接入本地模型」按钮**还在**，
+但一点就弹一行红字：`请求失败：ctx.settings.section is not a function`；
+状态点也就永远是灰的（它靠 `/watch` 轮询，同样读设置）。
+
+**根因**（`node_modules/@deepseek-ai/dsh-settings` 两个版本对着读出来的）：
+
+| | 0.1.5-rc.3 | 0.2.0-rc.2 |
+|---|---|---|
+| `ctx.settings` 是谁 | `SettingsProvider` | `SettingsForms` |
+| 读一节现状 | `section(ns)` —— 但它在 `.d.ts` 里是 **`private`** | **没有这个方法**（整个删掉） |
+| 公开读口径 | `register()` → scope `.get()` | `describe()` → 每行 `{ ns, value, base, user, revision }` |
+
+老代码调的是那个私有 `section(ns)`：TS 里写着 `private`，JS 不拦，所以一直跑得通 —— 直到升级
+把它删掉。`/state` 不读设置所以照常 200，`/watch` 与 `/panel` 则统一回 `{ok:false,error:...}`
+（`apply()` 里 `guard()` 把异常收成 200 + error 字段，页面上就是那句红字）。
+
+**改法**：加 `readSection(ctx)`，读 `describe()` 里 `ns === 'llm-pi-ai'` 那一行的 **`user`** 字段。
+
+* 必须是 `user`（用户层 = `cordis.patch.yml` 里那一层 = `mutate()` 写的那一层），
+  **不能图省事读 `value`**：那是 schema 解析后的活值、带着默认值，拿它当「现状」会让
+  `diffProfile` 把默认值误判成「用户写过」—— 于是每次点按钮都报「有变化」，再把这些默认值
+  一并写进用户的 patch。读错一层，写就跟着写脏。
+* `describe()` 只列活着的条目：`llm-pi-ai` 没挂载、或条目在而用户从没写过 → 落回 `{}`（与老代码同义）。
+
+**回归**：两处 `section()` 调用都换掉；测试的假宿主**照着 0.2 的真实形状重建**
+（只有 `describe()`/`mutate()`，**不给** `section()` —— 谁写回去，本地当场炸，而不是等升级后线上炸），
+并补两条用例：`读设置只走公开口径 describe()`、`现状读的是 user 层（schema 默认值不算用户写过）`。
+86 条全过（原 84 + 2，均为端到端层）。拿 HEAD 里那一版旧插件跑同一份测试：19 条端到端全红，
+其中就有这两条 —— 说明这版测试确实抓得住这个 bug。
+
+**部署**：按老规矩换成 `local-models-connect.v11.mjs` + 改 `cordis.patch.yml` 里那一行；
+`~/.dsh/plugins/` 的软链与清单里那条通配
+（`{host: dsh-plugin/local-models-connect.v*.mjs, link: local-models-connect.v*.mjs}`）都不用动。
+
+**但只改 patch 那一行没用**（这是这次新撞出来的、也是 §8 那条旧结论失效的地方）。实测：
+
+| 动作 | 结果 |
+|---|---|
+| 只把 patch 里 `name` 从 v10 改成 v11 | `/state` 仍报 **1.8.0**（旧模块继续跑；v10 软链当时已是断链，说明它压根没重新 import） |
+| 同时改 patch 里同一 id 的 `config`（`autoHideMs: 12000 → 4321`） | **立刻生效** —— patch 确实重载了，只是不换模块 |
+
+读 `@deepseek-ai/cordis-plugin-loader` 的 `Entry.update()` 能对上：`name` 变了只进 `pending`
+列表，`_patchContext()` 里只有 `config` / `group` 才会 `fiber.update()`，没有任何地方因此
+dispose + 重新 `import`。所以「换文件名让宿主重新加载」这条在 0.2 上只剩「**重启 `dsh web`**」
+一条路 —— 而重启会打断正在跑的会话。
+
+**这次怎么绕开重启的**（只动运行中的 patch，不动仓库）：借 `EntryGroup.update()` 里
+「**新 id 才 `create()` → `init()` → 真 import**」这条缝，分四步走：
+
+1. 老条目的 patch 上加 `disabled: true` → 老 fiber 被 dispose（`/state` 404），先腾出路由；
+2. 换一个**新 entry id**（`local-models-connect-v11`）指向 v11 文件 → 真 import 新模块
+   （`/state` 立刻报 **1.9.0**）；
+3. 把这条 insert 整段删掉 → 新 id 被移除（短暂 404）；
+4. 再按**标准 id**（`local-models-connect`）+ v11 文件名挂回去 → 又是新 id 的 `create()`，
+   重新 import（这次命中 Node 的 ESM 缓存，跑的还是 v11）。
+
+四步都留了 `POST /watch` 的观测记录；收尾后 patch 与备份逐字节只差 `v10 → v11` 一处，
+仓库 / 文档 / 清单里没有任何「临时 id」的残留 —— 下次重启后一切照旧。
+
+**验收**（2026-10-07 深夜，真 GUI）：
+
+* `POST /panel` → `{ok:true}`，三块视图 8 + 2 + 1 行，`verdict: ok`（6 通过 / 0 提醒 / 0 失败），
+  写入那行是「未写入设置（无需改动）」—— 幂等，没碰 `llm-pi-ai` 的声明；
+* 真 Chromium（patchright）打开真 GUI 点按钮：面板 11 行 / 9 根状态点、状态点 `lmc-dot ok`、
+  **没有「请求失败」那行**、0 条 console 错误、0 个失败请求；截图留在
+  `Skill-me/shots/lmc-panel-20261008.png`，脚本 `shots/lmc-panel-check.py` 可复跑。
+  （headless 里真鼠标路径在这张重页面上不稳：按钮浮在右下角，与鲸鱼挂件同区，
+  mousedown/mouseup 之间节点会被重挂 → 改用真实 DOM 的 `.click()` 触发；会话头里那个正常位置不受影响。）

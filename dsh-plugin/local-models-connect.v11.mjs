@@ -79,21 +79,52 @@
  *     给一个无鉴权的本地端点挂上凭据名，会把能用的端点变成用不了的；
  *   · 任一步失败只回报，不写文件；写失败也不回滚已验证的其它 provider。
  *
+ * ## 读设置：只走公开口径 `describe()`（dsh 0.2 起）
+ *
+ * 老代码读现状用的是 `ctx.settings.section(NS)` —— 那是 0.1 `SettingsProvider` 上的**私有**
+ * 方法，能跑纯属 JS 不拦 TS 的 `private`。dsh 0.2.0-rc.2 把 `ctx.settings` 换成了
+ * `SettingsForms`，`section()` 整个删掉，于是两条读设置的路由（`/watch`、`/panel`，
+ * 也就是那个按钮）在升级后统一回 `请求失败：ctx.settings.section is not a function` ——
+ * 按钮还在，是它打的那条请求在宿主里抛了。
+ *
+ * 公开口径只剩 `describe()`：它按 profile 条目 id 给出每一条的
+ * `{ ns, value, base, user, revision }`。本插件要的是 **`user`**（`cordis.patch.yml` 里那一层，
+ * 也正是 `mutate()` 写的那一层）。**不能取 `value`**：那是 schema 解析后的活值，带着默认值；
+ * 拿它当「现状」会让 `diffProfile` 把默认值误判成「用户写过」，于是每次点按钮都报「有变化」，
+ * 再把这些默认值一并写进用户的 patch —— 读错一层，写就跟着写脏。
+ *
+ * `describe()` 只列**活着的**条目，所以 `llm-pi-ai` 没挂载时读回 `{}`（与老代码同义）；
+ * 条目在而用户从没写过 → `user` 为 `undefined`，同样落回 `{}`。
+ *
  * ## 迭代提示
  *
- * Cordis 只在 `name`（= 文件路径）变化时才重新 `import` 模块（ESM 有模块缓存），
- * 所以改内容要装成新文件名（v2、v3…）并改 `cordis.patch.yml` 里那一行；
+ * 改内容要装成新文件名（v2、v3…）并改 `cordis.patch.yml` 里那一行 —— ESM 有模块缓存，
  * 只重存同一个文件不会重新加载。
+ *
+ * 但**在 dsh 0.2 上，光改 patch 里那一行也不够**（2026-10-07 实测）：loader 的
+ * `Entry.update()` 对「只有 `name` 不同」的 diff 不会 dispose、也不会重新 import
+ * （只有 `config` / `group` 变了才 `fiber.update()`），所以正在跑的仍是旧模块 ——
+ * 要么重启 `dsh web`，要么借道一个新的 entry id（新 id 才会 `create()` → `init()` → 真 import；
+ * 四步做法与实测见 `docs/DSH-MODEL-SYNC.md` 文末那一节）。
  */
 
 export const name = 'local-models-connect'
 export const inject = ['webServer', 'settings']
 
 /** 版本号 —— 自检报告里回显，方便确认页面上跑的是哪一版。 */
-const VERSION = '1.8.1'
+const VERSION = '1.9.0'
 
 /** 写入的设置命名空间（`llm-pi-ai` 的注册者见 dsh-llm-pi-ai）。 */
 const NS = 'llm-pi-ai'
+
+/**
+ * 读 `NS` 这一节的**用户截面**（= `mutate` 写的那一层）。为什么是 `describe().user` 见文件头。
+ * @returns 该节的用户层；没有则空对象（调用方一律当「还没有 provider」处理）。
+ */
+function readSection(ctx, ns = NS) {
+  const row = ctx.settings.describe().find((entry) => entry.ns === ns)
+  return row?.user ?? {}
+}
 
 /** 三条路由：状态、接入、自检；外加 v1 的旧路径做兼容别名。 */
 const ROUTE_STATE = '/local-models-connect/state'
@@ -823,32 +854,6 @@ let inFlight = null
 /** 最近一次的报告缓存，供页面 `/state` 免网络读取。 */
 const cache = { run: null, selfCheck: null }
 
-/**
- * 读一个设置段的**当前值**。
- *
- * 为什么不直接写 `ctx.settings.section(ns)`：DSH **0.2.0 换掉了 settings 服务的方法** ——
- * `section(ns)` 在 0.2.0-rc.2 上根本不存在（服务类只有 describe / update / replace /
- * mutate / write / schema / configure / invalidate），读值改走 `describe()`：它返回**条目
- * 描述符数组**，`ns` 是 profile 条目 id、`value` 是投影后的活值。
- * 症状（2026-10-05 升到 0.2.0-rc.2 后实测）：点「自检」或「接入本地模型」，
- * 路由回 `{"ok":false,"error":"ctx.settings.section is not a function"}`。
- *
- * 留着 `section()` 那条分支是为了兼容还没升级的 0.1.x 宿主（两代同时在跑的那段时间）。
- * @param {object} ctx - 插件上下文。
- * @param {string} ns - 设置命名空间（= profile 条目 id，本插件是 `llm-pi-ai`）。
- * @returns {object} 该段的活值；拿不到就回空对象（调用方都按 `?.` 容错写）。
- */
-function readSection(ctx, ns) {
-  const svc = ctx.settings
-  if (svc === undefined || svc === null) return {}
-  if (typeof svc.section === 'function') return svc.section(ns) ?? {}
-  if (typeof svc.describe === 'function') {
-    const hit = svc.describe().find((descriptor) => descriptor.ns === ns)
-    if (hit !== undefined && typeof hit.value === 'object' && hit.value !== null) return hit.value
-  }
-  return {}
-}
-
 async function probeAll(config, section) {
   const targets = candidateTargets(config, section)
   const results = await mapLimited(targets, config.concurrency, (target) => {
@@ -865,7 +870,7 @@ async function probeAll(config, section) {
  * @param options.dryRun - true 时只算不写（`?dry=1`）。
  */
 async function runConnect(ctx, config, options = {}) {
-  const section = readSection(ctx, NS)
+  const section = readSection(ctx)
   const dryRun = options.dryRun === true
   const { targets, results } = await probeAll(config, section)
 
@@ -953,7 +958,7 @@ async function runConnect(ctx, config, options = {}) {
  * 判定口径全部落在「可复现的事实」上，不做主观评价。
  */
 async function selfCheck(ctx, config) {
-  const section = readSection(ctx, NS)
+  const section = readSection(ctx)
   const checks = []
   const add = (id, level, title, detail) => checks.push({ id, level, title, detail })
 
